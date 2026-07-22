@@ -14,6 +14,10 @@ public static class AppContentExports
     private const string Temp0MountPoint = "/temp0";
     private const uint AppParamSkuFlag = 0;
     private const int AppParamSkuFlagFull = 3;
+    private const int AppContentErrorParameter = unchecked((int)0x80D90002);
+    private const int AppContentErrorNotMounted = unchecked((int)0x80D90004);
+    private const int AppContentErrorDrmNoEntitlement = unchecked((int)0x80D90007);
+    private const int MountPointSize = 16;
 
     [SysAbiExport(
         Nid = "R9lA82OraNs",
@@ -121,6 +125,86 @@ public static class AppContentExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    [SysAbiExport(
+        Nid = "a5N7lAG0y2Q",
+        ExportName = "sceAppContentTemporaryDataFormat",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAppContent")]
+    public static int AppContentTemporaryDataFormat(CpuContext ctx) =>
+        ctx[CpuRegister.Rdi] == 0 ? ctx.SetReturn(AppContentErrorParameter) : ctx.SetReturn(0);
+
+    [SysAbiExport(
+        Nid = "VANhIWcqYak",
+        ExportName = "sceAppContentAddcontMount",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAppContent")]
+    public static int AppContentAddcontMount(CpuContext ctx)
+    {
+        var entitlementLabelAddress = ctx[CpuRegister.Rsi];
+        var mountPointAddress = ctx[CpuRegister.Rdx];
+        if (entitlementLabelAddress == 0 || mountPointAddress == 0)
+        {
+            return ctx.SetReturn(AppContentErrorParameter);
+        }
+
+        return ctx.Memory.TryWrite(mountPointAddress, new byte[MountPointSize])
+            ? ctx.SetReturn(AppContentErrorDrmNoEntitlement)
+            : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "3rHWaV-1KC4",
+        ExportName = "sceAppContentAddcontUnmount",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAppContent")]
+    public static int AppContentAddcontUnmount(CpuContext ctx)
+    {
+        var mountPointAddress = ctx[CpuRegister.Rdi];
+        if (mountPointAddress == 0)
+        {
+            return ctx.SetReturn(AppContentErrorParameter);
+        }
+
+        Span<byte> firstByte = stackalloc byte[1];
+        if (!ctx.Memory.TryRead(mountPointAddress, firstByte))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return ctx.SetReturn(firstByte[0] == 0 ? AppContentErrorNotMounted : 0);
+    }
+
+    [SysAbiExport(
+        Nid = "SaKib2Ug0yI",
+        ExportName = "sceAppContentTemporaryDataGetAvailableSpaceKb",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAppContent")]
+    public static int AppContentTemporaryDataGetAvailableSpaceKb(CpuContext ctx)
+    {
+        var mountPointAddress = ctx[CpuRegister.Rdi];
+        var availableSpaceAddress = ctx[CpuRegister.Rsi];
+        if (mountPointAddress == 0 || availableSpaceAddress == 0 ||
+            !TryReadMountPoint(ctx, mountPointAddress, out var mountPoint) ||
+            !mountPoint.StartsWith(Temp0MountPoint, StringComparison.Ordinal))
+        {
+            return ctx.SetReturn(AppContentErrorParameter);
+        }
+
+        try
+        {
+            Directory.CreateDirectory(ResolveTemp0Root());
+            var root = Path.GetPathRoot(Path.GetFullPath(ResolveTemp0Root()));
+            var availableKb = (ulong)new DriveInfo(root!).AvailableFreeSpace / 1024UL;
+            Span<byte> spaceBytes = stackalloc byte[sizeof(ulong)];
+            BinaryPrimitives.WriteUInt64LittleEndian(spaceBytes, availableKb);
+            return ctx.Memory.TryWrite(availableSpaceAddress, spaceBytes)
+                ? ctx.SetReturn(0)
+                : ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+        catch (IOException) { return ctx.SetReturn(AppContentErrorParameter); }
+        catch (UnauthorizedAccessException) { return ctx.SetReturn(AppContentErrorParameter); }
+    }
+
     // Download data is not emulated as a real quota; report a comfortable
     // fixed amount of free space so titles never take the "storage full" path.
     [SysAbiExport(
@@ -193,6 +277,20 @@ public static class AppContentExports
         {
             return true;
         }
+    }
+
+    private static bool TryReadMountPoint(CpuContext ctx, ulong address, out string mountPoint)
+    {
+        Span<byte> bytes = stackalloc byte[MountPointSize];
+        if (!ctx.Memory.TryRead(address, bytes))
+        {
+            mountPoint = string.Empty;
+            return false;
+        }
+
+        var terminator = bytes.IndexOf((byte)0);
+        mountPoint = Encoding.ASCII.GetString(bytes[..(terminator < 0 ? bytes.Length : terminator)]);
+        return true;
     }
 
     private static void TraceAppContent(string message)

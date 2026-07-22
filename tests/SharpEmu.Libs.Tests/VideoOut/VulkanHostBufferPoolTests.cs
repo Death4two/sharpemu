@@ -58,3 +58,22 @@ public sealed class VulkanHostBufferPoolTests
         VulkanHostBufferPoolKey key) =>
         new(new VkBuffer(buffer), new DeviceMemory(memory), key, 0);
 }
+
+public sealed class GuestImageVariantKeyTests
+{
+    [Fact]
+    public void StorageSizedImagesDoNotAliasDisplayScaledImages()
+    {
+        var renderTarget = new GuestImageVariantKey(
+            0x1000,
+            1280,
+            720,
+            1,
+            0x0A,
+            Format.R8G8B8A8Unorm,
+            StorageSized: false);
+        var storageImage = renderTarget with { StorageSized = true };
+
+        Assert.NotEqual(renderTarget, storageImage);
+    }
+}

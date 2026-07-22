@@ -17,6 +17,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
     private readonly object _guestAllocationGate = new();
     private readonly object _allocationSearchHintGate = new();
     private readonly List<MemoryRegion> _regions = new();
+    private readonly HashSet<ulong> _persistentReservationBases = [];
     private readonly Dictionary<(ulong DesiredAddress, ulong Alignment, bool Executable), ulong> _allocationSearchHints = new();
     private readonly Dictionary<ulong, ProgramHeaderFlags> _pageProtections = new();
     private bool _disposed;
@@ -34,6 +35,48 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
     private const ulong DefaultLazyReservePrimeBytes = 0x0400_0000UL; // 64 MiB
     private const ulong LazyReservePrimeChunkBytes = 0x0200_0000UL; // 32 MiB
     private const int CommittedRangeCacheCapacity = 4;
+    private const ulong Ps5MainImageBase = 0x0000000800000000UL;
+    // The fixed PS5 executable can be larger than 64 MiB (PPSA03524 is ~121 MiB).
+    private const ulong Ps5MainImageWindowSize = 0x10000000UL;
+    private const uint MemReserve = 0x00002000;
+    private const uint PageNoAccess = 0x01;
+    private static ulong _earlyPersistentReservationBase;
+    private static ulong _earlyPersistentReservationSize;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern nint VirtualAlloc(
+        nint address,
+        nuint size,
+        uint allocationType,
+        uint protection);
+
+    /// <summary>Claims the PS5 fixed image window before normal managed startup.</summary>
+    public static bool TryReservePs5MainImageWindowEarly()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return false;
+        }
+
+        if (Volatile.Read(ref _earlyPersistentReservationBase) == Ps5MainImageBase)
+        {
+            return true;
+        }
+
+        var address = (ulong)VirtualAlloc(
+            unchecked((nint)Ps5MainImageBase),
+            (nuint)Ps5MainImageWindowSize,
+            MemReserve,
+            PageNoAccess);
+        if (address != Ps5MainImageBase)
+        {
+            return false;
+        }
+
+        Volatile.Write(ref _earlyPersistentReservationSize, Ps5MainImageWindowSize);
+        Volatile.Write(ref _earlyPersistentReservationBase, address);
+        return true;
+    }
 
     private sealed class CommittedRangeCache
     {
@@ -272,6 +315,129 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         var allocationKind = executable ? "executable memory" : "data memory";
         TraceVmem($"Allocated exact {allocationKind}: 0x{actualAddress:X16} - 0x{actualAddress + alignedSize:X16} ({alignedSize} bytes)");
         return true;
+    }
+
+    /// <summary>
+    /// Claims a fixed guest range before managed runtime initialization can
+    /// reserve across it. The reservation remains available to a later main
+    /// image load and is committed lazily while ELF segments are mapped.
+    /// </summary>
+    public bool TryReservePersistentAtExact(ulong desiredAddress, ulong size)
+    {
+        if (size == 0)
+        {
+            return false;
+        }
+
+        var alignedSize = AlignUp(size, PageSize);
+        var actualAddress = _hostMemory.Reserve(
+            desiredAddress,
+            alignedSize,
+            HostPageProtection.NoAccess);
+        if (actualAddress != desiredAddress)
+        {
+            if (actualAddress != 0)
+            {
+                _hostMemory.Free(actualAddress);
+            }
+
+            return false;
+        }
+
+        _gate.EnterWriteLock();
+        try
+        {
+            InsertRegionSorted(new MemoryRegion
+            {
+                VirtualAddress = actualAddress,
+                Size = alignedSize,
+                IsExecutable = true,
+                IsReservedOnly = true,
+                Protection = HostMemory.PAGE_NOACCESS,
+            });
+            _persistentReservationBases.Add(actualAddress);
+        }
+        finally
+        {
+            _gate.ExitWriteLock();
+        }
+
+        TraceVmem($"Reserved persistent fixed guest range: 0x{actualAddress:X16} - " +
+            $"0x{actualAddress + alignedSize:X16} ({alignedSize} bytes)");
+        return true;
+    }
+
+    public bool TryAdoptEarlyPersistentReservation(ulong desiredAddress, ulong size)
+    {
+        var reservationBase = Volatile.Read(ref _earlyPersistentReservationBase);
+        var reservationSize = Volatile.Read(ref _earlyPersistentReservationSize);
+        if (reservationBase != desiredAddress)
+        {
+            // The CLI parent may reserve this range in a suspended child with
+            // VirtualAllocEx, which intentionally has no managed static marker
+            // in the child yet. Adopt only a reservation rooted exactly here;
+            // never mistake a broad host/CLR reservation for guest memory.
+            if (!_hostMemory.Query(desiredAddress, out var info) ||
+                info.State != HostRegionState.Reserved ||
+                info.AllocationBase != desiredAddress)
+            {
+                return false;
+            }
+
+            reservationBase = desiredAddress;
+            reservationSize = info.RegionSize;
+        }
+
+        if (size == 0 || size > reservationSize)
+        {
+            return false;
+        }
+
+        _gate.EnterWriteLock();
+        try
+        {
+            if (_persistentReservationBases.Contains(desiredAddress))
+            {
+                return true;
+            }
+
+            InsertRegionSorted(new MemoryRegion
+            {
+                VirtualAddress = desiredAddress,
+                Size = reservationSize,
+                IsExecutable = true,
+                IsReservedOnly = true,
+                Protection = HostMemory.PAGE_NOACCESS,
+            });
+            _persistentReservationBases.Add(desiredAddress);
+            return true;
+        }
+        finally
+        {
+            _gate.ExitWriteLock();
+        }
+    }
+
+    public bool HasPersistentReservationCovering(ulong address, ulong size)
+    {
+        if (size == 0 || address > ulong.MaxValue - size)
+        {
+            return false;
+        }
+
+        _gate.EnterReadLock();
+        try
+        {
+            return _regions.Any(region =>
+                region.IsReservedOnly &&
+                _persistentReservationBases.Contains(region.VirtualAddress) &&
+                address >= region.VirtualAddress &&
+                address + size <= region.VirtualAddress + region.Size);
+        }
+        finally
+        {
+            _gate.ExitReadLock();
+        }
     }
 
     public string DescribeAddressForDiagnostics(ulong address)
@@ -530,6 +696,80 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         return false;
     }
 
+    /// <summary>
+    /// Commits a pre-existing fixed reservation in place. This deliberately
+    /// does not allocate free pages: callers use it only after a protection
+    /// change proved that the guest allocator owns an already-reserved span.
+    /// </summary>
+    public bool TryCommitFixedRange(ulong address, ulong size, bool executable)
+    {
+        if (size == 0)
+        {
+            return false;
+        }
+
+        var start = AlignDown(address, PageSize);
+        var end = AlignUp(address + size, PageSize);
+        if (end <= start)
+        {
+            return false;
+        }
+
+        var protection = executable ? HostPageProtection.ReadWriteExecute : HostPageProtection.ReadWrite;
+        var cursor = start;
+        while (cursor < end)
+        {
+            if (!_hostMemory.Query(cursor, out var info))
+            {
+                TraceFixedRangeFailure("query failed", cursor, end - cursor);
+                return false;
+            }
+
+            var queriedEnd = info.RegionSize > ulong.MaxValue - info.BaseAddress
+                ? ulong.MaxValue
+                : info.BaseAddress + info.RegionSize;
+            var rangeEnd = Math.Min(end, queriedEnd);
+            if (rangeEnd <= cursor || info.State == HostRegionState.Free)
+            {
+                TraceFixedRangeFailure(
+                    info.State == HostRegionState.Free ? "host range is free" : "invalid host query span",
+                    cursor,
+                    end - cursor,
+                    info);
+                return false;
+            }
+
+            if (info.State == HostRegionState.Reserved &&
+                !_hostMemory.Commit(cursor, rangeEnd - cursor, protection))
+            {
+                TraceFixedRangeFailure("host commit failed", cursor, rangeEnd - cursor, info);
+                return false;
+            }
+
+            cursor = rangeEnd;
+        }
+
+        return true;
+    }
+
+    private static void TraceFixedRangeFailure(
+        string reason,
+        ulong address,
+        ulong size,
+        HostRegionInfo? info = null)
+    {
+        if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_VIRTUAL_MEMORY"), "1", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var host = info is { } value
+            ? $" state={value.State} base=0x{value.BaseAddress:X16} allocation_base=0x{value.AllocationBase:X16} region_size=0x{value.RegionSize:X} raw_state=0x{value.RawState:X} raw_protect=0x{value.RawProtection:X}"
+            : string.Empty;
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] commit fixed range: {reason} at 0x{address:X16} len=0x{size:X}{host}");
+    }
+
     public bool TryAllocateAtOrAbove(
         ulong desiredAddress,
         ulong size,
@@ -586,6 +826,19 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
             if (TryGetOverlappingRegionEnd(cursor, alignedSize, out var overlapEnd))
             {
+                // A suspended launcher reserves fixed guest windows before
+                // CoreCLR starts.  Those windows are deliberately represented
+                // as persistent reserved regions, not allocations to skip.
+                // Consume the requested slice in place; otherwise an ordinary
+                // non-fixed mmap search walks past the Unity heap window and
+                // relocates it from 0x600... to an unreserved host range.
+                if (TryCommitPersistentReservationRange(cursor, alignedSize))
+                {
+                    actualAddress = cursor;
+                    UpdateAllocationSearchCursor(desiredAddress, effectiveAlignment, executable, actualAddress + alignedSize);
+                    return true;
+                }
+
                 cursor = AlignUp(overlapEnd, effectiveAlignment);
                 continue;
             }
@@ -600,6 +853,23 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         }
 
         return false;
+    }
+
+    private bool TryCommitPersistentReservationRange(ulong address, ulong size)
+    {
+        _gate.EnterReadLock();
+        try
+        {
+            var region = FindRegion(address, size);
+            return region is not null &&
+                   region.IsReservedOnly &&
+                   _persistentReservationBases.Contains(region.VirtualAddress) &&
+                   EnsureRangeCommitted(address, size, region);
+        }
+        finally
+        {
+            _gate.ExitReadLock();
+        }
     }
 
     private void ReleaseUntrackedAllocation(ulong address)
@@ -748,6 +1018,22 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             return false;
         }
 
+        _gate.EnterReadLock();
+        try
+        {
+            var region = FindRegion(address, size);
+            if (region is not null &&
+                region.IsReservedOnly &&
+                !EnsureRangeCommitted(address, size, region))
+            {
+                return false;
+            }
+        }
+        finally
+        {
+            _gate.ExitReadLock();
+        }
+
         return _hostMemory.Protect(address, size, ResolveProtection(protection), out _);
     }
 
@@ -778,16 +1064,29 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
     public void Clear()
     {
+        Clear(preservePersistentReservations: false);
+    }
+
+    public void Clear(bool preservePersistentReservations)
+    {
         lock (_guestAllocationGate)
         {
             _gate.EnterWriteLock();
             try
             {
-                foreach (var region in _regions)
+                for (var index = _regions.Count - 1; index >= 0; index--)
                 {
+                    var region = _regions[index];
+                    if (preservePersistentReservations &&
+                        _persistentReservationBases.Contains(region.VirtualAddress))
+                    {
+                        continue;
+                    }
+
                     _hostMemory.Free(region.VirtualAddress);
+                    _persistentReservationBases.Remove(region.VirtualAddress);
+                    _regions.RemoveAt(index);
                 }
-                _regions.Clear();
                 _pageProtections.Clear();
                 lock (_allocationSearchHintGate)
                 {
@@ -827,6 +1126,12 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             {
                 var isExecutable = (protection & ProgramHeaderFlags.Execute) != 0;
                 AllocateAt(mapStart, mapSize, isExecutable, allowAlternative: false);
+            }
+            else if (existingRegion.IsReservedOnly &&
+                     !EnsureRangeCommitted(mapStart, mapSize, existingRegion))
+            {
+                throw new InvalidOperationException(
+                    $"Failed to commit reserved mapping at 0x{mapStart:X16} ({mapSize} bytes)");
             }
 
             var stageProtection = (protection & ProgramHeaderFlags.Execute) != 0

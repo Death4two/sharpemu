@@ -207,6 +207,14 @@ public static partial class Gen5MslTranslator
                 // ---- integer arithmetic ----
                 "VAddU32" or "VAddI32" =>
                     $"(({RawSource(instruction, 0)}) + ({RawSource(instruction, 1)}))",
+                // V_SAD_U32: |src0 - src1| + src2.  Preserve unsigned
+                // subtraction semantics; PS5 NGG fetch shaders use this for
+                // their vertex-index offset accumulator.
+                "VSadU32" =>
+                    $"((({RawSource(instruction, 0)}) >= ({RawSource(instruction, 1)}) ? " +
+                    $"(({RawSource(instruction, 0)}) - ({RawSource(instruction, 1)})) : " +
+                    $"(({RawSource(instruction, 1)}) - ({RawSource(instruction, 0)}))) + " +
+                    $"({RawSource(instruction, 2)}))",
                 "VSubU32" or "VSubI32" =>
                     $"(({RawSource(instruction, 0)}) - ({RawSource(instruction, 1)}))",
                 "VSubrevU32" or "VSubrevI32" =>

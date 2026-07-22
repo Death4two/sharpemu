@@ -50,6 +50,7 @@ public static partial class AgcExports
     private const uint ItDispatchIndirect = 0x16;
     private const uint ItWaitRegMem = 0x3C;
     private const uint ItIndirectBuffer = 0x3F;
+    private const uint ItCopyData = 0x40;
     private const uint ItEventWrite = 0x46;
     private const uint ItReleaseMem = 0x49;
     private const uint ItDmaData = 0x50;
@@ -132,10 +133,15 @@ public static partial class AgcExports
     private const uint DbDepthSizeXy = 0x007;
     private const uint DbDepthClear = 0x00B;
     private const uint DbZInfo = 0x010;
+    private const uint DbStencilInfo = 0x011;
     private const uint DbZReadBase = 0x012;
+    private const uint DbStencilReadBase = 0x013;
     private const uint DbZWriteBase = 0x014;
+    private const uint DbStencilWriteBase = 0x015;
     private const uint DbZReadBaseHi = 0x01A;
+    private const uint DbStencilReadBaseHi = 0x01B;
     private const uint DbZWriteBaseHi = 0x01C;
+    private const uint DbStencilWriteBaseHi = 0x01D;
     private const int ColorTargetCount = 8;
     private const uint PsTextureUserDataRegister = 0xC;
     private const uint VsUserDataRegister = 0x4C;
@@ -257,9 +263,12 @@ public static partial class AgcExports
         Environment.GetEnvironmentVariable("SHARPEMU_TRACE_VERTEX_RANGES"),
         "1",
         StringComparison.Ordinal);
-    private static readonly bool _compatibilitySubmitCompletionEvent = string.Equals(
+    // AGC driver completion is an end-of-pipe notification, not an event-ID-0
+    // packet. Signal every registered graphics completion event by default;
+    // retain the old ID-0-only behavior as a narrow diagnostic escape hatch.
+    private static readonly bool _useLegacySubmitCompletionEvent = string.Equals(
         Environment.GetEnvironmentVariable("SHARPEMU_AGC_SUBMIT_COMPLETION_EVENT"),
-        "1",
+        "0",
         StringComparison.Ordinal);
     // Escape hatch for the cached-texture copy skip (per-draw texel copies
     // are re-enabled unconditionally when set), for A/B-ing rendering issues.
@@ -413,7 +422,8 @@ public static partial class AgcExports
         uint Height,
         uint Format,
         uint NumberType,
-        uint TileMode);
+        uint TileMode,
+        uint Samples = 1);
 
     private sealed record TranslatedGuestDraw(
         ulong ExportShaderAddress,
@@ -2667,6 +2677,171 @@ public static partial class AgcExports
     }
 
     [SysAbiExport(
+        Nid = "Zw7uUVPulbw",
+        ExportName = "sceAgcDriverGetEqContextId",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgcDriver")]
+    public static int DriverGetEqContextId(CpuContext ctx)
+    {
+        var eventAddress = ctx[CpuRegister.Rdi];
+        if (eventAddress == 0 ||
+            !ctx.TryReadUInt64(eventAddress, out var ident) ||
+            !TryReadInt16(ctx, eventAddress + 8, out var filter) ||
+            !ctx.TryReadUInt64(eventAddress + 16, out var data))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        // libGraphicsDriver: graphics events expose their context through
+        // data; other kernel events use ident.
+        ctx[CpuRegister.Rax] = unchecked((uint)(
+            filter == KernelEventQueueCompatExports.KernelEventFilterGraphics
+                ? data
+                : ident));
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // Source-backed port of Kyty's Graphics5UnknownDb.  Unity uses this to
+    // construct its 32-entry graphics descriptor table before rendering.
+    [SysAbiExport(
+        Nid = "dbOlWdppb4o",
+        ExportName = "sceAgcGraphics5UnknownDb",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int Graphics5UnknownDb(CpuContext ctx)
+    {
+        var outputAddress = ctx[CpuRegister.Rdi];
+        var descriptorAddress = ctx[CpuRegister.Rsi];
+        var sourceAddress = ctx[CpuRegister.Rdx];
+        if (outputAddress == 0)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        if (sourceAddress == 0 ||
+            !TryReadUInt32(ctx, sourceAddress + 0x50, out var count) ||
+            count == 0)
+        {
+            return WriteGraphics5UnknownDbDefaults(ctx, outputAddress, 0)
+                ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK)
+                : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (count > 32 || descriptorAddress == 0 ||
+            !TryReadUInt16(ctx, descriptorAddress + 0x56, out var maskCount) ||
+            !ctx.TryReadUInt64(descriptorAddress + 0x38, out var masksAddress) ||
+            !ctx.TryReadUInt64(sourceAddress + 0x30, out var entriesAddress) ||
+            (maskCount != 0 && masksAddress == 0) || entriesAddress == 0)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        var masks = new uint[maskCount];
+        for (var index = 0; index < masks.Length; index++)
+        {
+            if (!TryReadUInt32(ctx, masksAddress + ((ulong)index * sizeof(uint)), out masks[index]))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+        }
+
+        for (uint index = 0; index < count; index++)
+        {
+            if (!TryReadUInt32(ctx, entriesAddress + ((ulong)index * sizeof(uint)), out var source))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+
+            var maskIndex = masks.Length;
+            for (var mask = 0; mask < masks.Length; mask++)
+            {
+                if ((byte)masks[mask] == (byte)source)
+                {
+                    maskIndex = mask;
+                    break;
+                }
+            }
+
+            var hasMask = maskIndex < masks.Length;
+            var mode = (source >> 20) & 3u;
+            uint flags;
+            if (mode == 0)
+            {
+                flags = (((source >> 24) & 1u) | (hasMask ? 0u : 1u)) << 5;
+                flags = ApplyGraphics5TwoBitField(flags, (source >> 28) & 3u, 8);
+            }
+            else
+            {
+                flags = ((source << 4) & 0x0300_0000u) + 0x0008_0000u;
+                if (mode == 2)
+                {
+                    flags &= 0xFFEF_FFDFu;
+                    flags |= hasMask ? ((~(masks[maskIndex] & source) >> 16) & 0x20u) : 0x20u;
+                    flags = ApplyGraphics5TwoBitField(flags, (source >> 30) & 3u, 8);
+                    flags = ApplyGraphics5TwoBitField(flags, (source >> 30) & 3u, 21);
+                }
+                else
+                {
+                    if (hasMask)
+                    {
+                        var masked = masks[maskIndex] & source;
+                        flags = (flags & 0xFFFF_FFDFu) | ((masked >> 15) & 0x20u);
+                        flags ^= 0x20u;
+                        flags = (flags & 0xFFEF_FFFFu) | ((~masked >> 1) & 0x0010_0000u);
+                        flags = ApplyGraphics5TwoBitField(flags, (source >> 30) & 3u, 8);
+                    }
+                    else
+                    {
+                        flags |= 0x0010_0020u;
+                        flags = ApplyGraphics5TwoBitField(flags, (source >> 28) & 3u, 8);
+                    }
+
+                    flags = ApplyGraphics5TwoBitField(flags, (source >> 30) & 3u, 21);
+                }
+            }
+
+            flags = hasMask
+                ? ApplyGraphics5FinalMask(flags, source, masks[maskIndex])
+                : flags & 0xFFFF_FBE0u;
+            if (!ctx.TryWriteUInt64(
+                    outputAddress + ((ulong)index * sizeof(ulong)),
+                    ((ulong)flags << 32) | (0x1000_0000u + index)))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+        }
+
+        return WriteGraphics5UnknownDbDefaults(ctx, outputAddress, count)
+            ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK)
+            : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    private static uint ApplyGraphics5TwoBitField(uint value, uint field, int shift) =>
+        (value & ~(3u << shift)) | ((field & 3u) << shift);
+
+    private static uint ApplyGraphics5FinalMask(uint flags, uint source, uint mask)
+    {
+        flags = (flags & 0xFFFF_FFE0u) | ((mask >> 8) & 0x1Fu);
+        return (flags & 0xFFFF_FBFFu) |
+            ((source & 0x0040_0000u) != 0 ? 0x400u : ((source >> 14) & 0x400u));
+    }
+
+    private static bool WriteGraphics5UnknownDbDefaults(CpuContext ctx, ulong outputAddress, uint first)
+    {
+        for (uint index = first; index < 32; index++)
+        {
+            if (!ctx.TryWriteUInt64(
+                    outputAddress + ((ulong)index * sizeof(ulong)),
+                    ((ulong)index << 32) | (0x1000_0000u + index)))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    [SysAbiExport(
         Nid = "UglJIZjGssM",
         ExportName = "sceAgcDriverSubmitDcb",
         Target = Generation.Gen5,
@@ -2957,30 +3132,25 @@ public static partial class AgcExports
         state.CompletionEventNotifiedSubmissionId = submissionId;
         void TriggerCompletionEvents()
         {
-            var triggered = KernelEventQueueCompatExports.TriggerRegisteredEvents(
-                ident: 0,
-                KernelEventQueueCompatExports.KernelEventFilterGraphics,
-                data: 0);
-            if (_compatibilitySubmitCompletionEvent)
-            {
-                triggered += KernelEventQueueCompatExports.TriggerRegisteredEventsDistinct(
+            var triggered = _useLegacySubmitCompletionEvent
+                ? KernelEventQueueCompatExports.TriggerRegisteredEvents(
+                    ident: 0,
+                    KernelEventQueueCompatExports.KernelEventFilterGraphics,
+                    data: 0)
+                : KernelEventQueueCompatExports.TriggerRegisteredEventsDistinct(
                     KernelEventQueueCompatExports.KernelEventFilterGraphics);
-            }
             TraceAgc(
                 $"agc.driver_submit_dcb completion submission={submissionId} " +
                 $"queues={triggered}");
         }
 
-        // A DCB is complete only after its translated Vulkan work and ordered
-        // guest-memory writes have finished. Put the notification on that same
-        // logical graphics queue instead of approximating completion with a
-        // timer, which can wake Unity while its upload data is still stale.
-        if (GuestGpu.Current.SubmitOrderedGuestAction(
-                TriggerCompletionEvents,
-                $"agc submit completion {submissionId}") == 0)
-        {
-            TriggerCompletionEvents();
-        }
+        // Kyty flushes the command processor and raises the queued graphics
+        // interrupt when the submission is accepted; it does not wait for the
+        // host GPU to finish rendering.  The distinct PM4 write/fence paths
+        // retain their own ordering.  Delaying this driver notification behind
+        // Vulkan work makes Unity's submitDone watchdog force progress every
+        // three seconds (TRC R4089).
+        TriggerCompletionEvents();
     }
 
     // Returns true only when parsing stopped on an unsatisfied WAIT_REG_MEM.
@@ -3219,6 +3389,11 @@ public static partial class AgcExports
             if (op == ItDmaData && length >= 7)
             {
                 ApplySubmittedStandardDmaData(ctx, gpuState, state, currentAddress);
+            }
+
+            if (op == ItCopyData && length >= 6)
+            {
+                ApplySubmittedCopyData(ctx, gpuState, state, currentAddress, tracePackets);
             }
 
             if (op == ItIndexBase &&
@@ -3615,46 +3790,111 @@ public static partial class AgcExports
             return;
         }
 
+        var selectorOffset = compactLayout ? 24UL : 4UL;
+        if (!TryReadUInt32(ctx, packetAddress + selectorOffset, out var selectors))
+        {
+            return;
+        }
+
+        var destinationSelector = compactLayout
+            ? (selectors >> 8) & 0xFFu
+            : selectors & 0xFFu;
+        var sourceSelector = compactLayout
+            ? selectors & 0xFFu
+            : (selectors >> 16) & 0xFFu;
+        var destinationIsMemory = destinationSelector is 0 or 3;
+        var sourceIsMemory = sourceSelector is 0 or 3;
+        // DMA_DATA source selector 2 is the packet's 32-bit immediate form.
+        // The old compact-layout heuristic accidentally excluded the 8-dword
+        // DCB form that Unity uses for its 512 KiB streaming uploads.
+        var immediateFill = sourceSelector == 2 && sourceAddress <= uint.MaxValue;
+
+        void Apply()
+        {
+            InvalidateDcbWindowIfOverlaps(destinationAddress, byteCount);
+            var copied =
+                byteCount != 0 &&
+                byteCount <= 256u * 1024u * 1024u &&
+                destinationAddress != 0 &&
+                (immediateFill
+                    ? TryFillGuestMemory(ctx, (uint)sourceAddress, destinationAddress, byteCount)
+                    : sourceAddress != 0 &&
+                      TryCopyGuestMemory(ctx, sourceAddress, destinationAddress, byteCount));
+            if (copied)
+            {
+                MirrorDmaWriteToGuestImage(
+                    ctx,
+                    destinationAddress,
+                    byteCount,
+                    immediateFill ? (uint)sourceAddress : null);
+            }
+
+            if (tracePacket)
+            {
+                TraceAgc(
+                    $"agc.dcb.dma_data dst=0x{destinationAddress:X16} " +
+                    $"src=0x{sourceAddress:X16} bytes={byteCount} " +
+                    $"fill={immediateFill} copied={copied}");
+            }
+        }
+
+        // Kyty processes DMA_DATA at command-processor time.  The guest-memory
+        // write must therefore happen now, even when its destination is a
+        // tracked image: MirrorDmaWriteToGuestImage enqueues the corresponding
+        // Vulkan upload in queue order.  Deferring the write itself behind
+        // prior rendering made Unity accumulate hundreds of identical 512 KiB
+        // DMA actions and then deadlock its streaming loop at backpressure.
+        if (destinationIsMemory &&
+            CanApplyDmaDirect(
+                destinationAddress,
+                sourceAddress,
+                byteCount,
+                sourceIsMemory,
+                immediateFill))
+        {
+            var producer = RegisterLabelProducer(
+                ctx.Memory,
+                state,
+                packetAddress,
+                destinationAddress,
+                byteCount,
+                $"agc_dma_data dst=0x{destinationAddress:X16} bytes={byteCount}");
+            Apply();
+            CompleteLabelProducer(producer);
+            lock (gpuState.WaitMonitorSignalGate)
+            {
+                gpuState.WaitMonitorSignalVersion++;
+                Monitor.Pulse(gpuState.WaitMonitorSignalGate);
+            }
+            return;
+        }
+
         SubmitOrderedGpuSideEffect(
             ctx,
             gpuState,
             state,
-            () =>
-            {
-                InvalidateDcbWindowIfOverlaps(destinationAddress, byteCount);
-                var immediateFill =
-                    compactLayout &&
-                    destinationAddress >= 0x10000 &&
-                    sourceAddress <= uint.MaxValue;
-                var copied =
-                    byteCount != 0 &&
-                    byteCount <= 256u * 1024u * 1024u &&
-                    destinationAddress != 0 &&
-                    (immediateFill
-                        ? TryFillGuestMemory(ctx, (uint)sourceAddress, destinationAddress, byteCount)
-                        : sourceAddress != 0 &&
-                          TryCopyGuestMemory(ctx, sourceAddress, destinationAddress, byteCount));
-                if (copied)
-                {
-                    MirrorDmaWriteToGuestImage(
-                        ctx,
-                        destinationAddress,
-                        byteCount,
-                        immediateFill ? (uint)sourceAddress : null);
-                }
-
-                if (tracePacket)
-                {
-                    TraceAgc(
-                        $"agc.dcb.dma_data dst=0x{destinationAddress:X16} " +
-                        $"src=0x{sourceAddress:X16} bytes={byteCount} " +
-                        $"fill={immediateFill} copied={copied}");
-                }
-            },
+            Apply,
             $"agc_dma_data dst=0x{destinationAddress:X16} bytes={byteCount}",
             packetAddress,
             destinationAddress,
             byteCount);
+    }
+
+    private static bool CanApplyDmaDirect(
+        ulong destinationAddress,
+        ulong sourceAddress,
+        uint byteCount,
+        bool sourceIsMemory,
+        bool immediateFill)
+    {
+        if (byteCount == 0 ||
+            byteCount > 256u * 1024u * 1024u ||
+            destinationAddress == 0)
+        {
+            return false;
+        }
+
+        return immediateFill || sourceIsMemory && sourceAddress != 0;
     }
 
     private static void SubmitOrderedGpuSideEffect(
@@ -4205,6 +4445,113 @@ public static partial class AgcExports
             writesGuestMemory ? byteCount : 0);
     }
 
+    // PKT3_COPY_DATA source selector 0x12 is the 64-bit GPU/reference clock.
+    // Games use it for timestamp queries; it must be ordered with the DCB,
+    // rather than being ignored as an unsupported register copy.
+    private static void ApplySubmittedCopyData(
+        CpuContext ctx,
+        SubmittedGpuState gpuState,
+        SubmittedDcbState state,
+        ulong packetAddress,
+        bool tracePacket)
+    {
+        if (!TryReadUInt32(ctx, packetAddress + 4, out var control) ||
+            !TryReadUInt64(ctx, packetAddress + 8, out var source) ||
+            !TryReadUInt64(ctx, packetAddress + 16, out var destination))
+        {
+            return;
+        }
+
+        var sourceSelect = ((control & 0xFu) << 1) | ((control >> 30) & 1u);
+        var destinationSelect = ((control >> 8) & 0xFu) << 1;
+        var byteCount = (control & (1u << 16)) != 0 ? 8u : 4u;
+        // Selector 2/4 names a memory destination after the packet's
+        // selector expansion. Other destinations are registers/queues and
+        // remain outside this CPU-visible DCB implementation.
+        var destinationIsMemory = destinationSelect is 2u or 4u;
+        if (sourceSelect == 0x12u && byteCount == 8 && destinationIsMemory &&
+            destination != 0 && (destination & 7) == 0)
+        {
+            SubmitOrderedGpuSideEffect(
+                ctx,
+                gpuState,
+                state,
+                () =>
+                {
+                    var clock = ScaleGpuReferenceClock(
+                        (ulong)System.Diagnostics.Stopwatch.GetTimestamp(),
+                        (ulong)System.Diagnostics.Stopwatch.Frequency);
+                    Span<byte> bytes = stackalloc byte[sizeof(ulong)];
+                    BinaryPrimitives.WriteUInt64LittleEndian(bytes, clock);
+                    InvalidateDcbWindowIfOverlaps(destination, sizeof(ulong));
+                    var wrote = ctx.Memory.TryWrite(destination, bytes);
+                    if (tracePacket)
+                    {
+                        TraceAgc($"agc.copy_data gpu_clock dst=0x{destination:X16} " +
+                            $"clock=0x{clock:X16} wrote={wrote}");
+                    }
+                },
+                $"copy_data gpu_clock dst=0x{destination:X16}",
+                packetAddress,
+                destination,
+                sizeof(ulong));
+            return;
+        }
+
+        // The regular memory and 32-bit-immediate forms are equivalent to a
+        // one-element DMA transfer.  Keep them ordered with the DCB so later
+        // waits and indirect arguments observe the guest-visible write.
+        var sourceIsMemory = sourceSelect is 2u or 4u;
+        var sourceIsImmediate = sourceSelect is 10u or 11u;
+        if (!destinationIsMemory || destination == 0 ||
+            (byteCount == 8 && (destination & 7) != 0) ||
+            (!sourceIsMemory && !(sourceIsImmediate && byteCount == 4)))
+        {
+            return;
+        }
+
+        SubmitOrderedGpuSideEffect(
+            ctx,
+            gpuState,
+            state,
+            () =>
+            {
+                InvalidateDcbWindowIfOverlaps(destination, byteCount);
+                var wrote = sourceIsMemory
+                    ? byteCount == 8
+                        ? ctx.TryReadUInt64(source, out var source64) &&
+                          ctx.TryWriteUInt64(destination, source64)
+                        : TryReadUInt32(ctx, source, out var source32) &&
+                          TryWriteUInt32(ctx, destination, source32)
+                    : TryWriteUInt32(ctx, destination, (uint)source);
+                if (tracePacket)
+                {
+                    TraceAgc($"agc.copy_data dst=0x{destination:X16} " +
+                        $"src=0x{source:X16} src_sel=0x{sourceSelect:X2} " +
+                        $"bytes={byteCount} wrote={wrote}");
+                }
+            },
+            $"copy_data dst=0x{destination:X16} bytes={byteCount}",
+            packetAddress,
+            destination,
+            byteCount);
+    }
+
+    internal static ulong ScaleGpuReferenceClock(ulong hostTicks, ulong hostFrequency)
+    {
+        if (hostFrequency == 0)
+        {
+            return 0;
+        }
+
+        // PS5's graphics timestamp domain is 100 MHz. Split the calculation
+        // to avoid multiplying an arbitrarily long host uptime by the rate.
+        var seconds = hostTicks / hostFrequency;
+        var remainder = hostTicks % hostFrequency;
+        return checked(seconds * 100_000_000UL +
+            (remainder * 100_000_000UL) / hostFrequency);
+    }
+
     private static void ApplySubmittedStandardDmaDataSnapshot(
         CpuContext ctx,
         uint control,
@@ -4510,6 +4857,11 @@ public static partial class AgcExports
             [DbZWriteBase] = 0x0123_4567u,
             [DbZReadBaseHi] = 2u,
             [DbZWriteBaseHi] = 2u,
+            [DbStencilInfo] = 1u,
+            [DbStencilReadBase] = 0x0234_5678u,
+            [DbStencilWriteBase] = 0x0234_5678u,
+            [DbStencilReadBaseHi] = 3u,
+            [DbStencilWriteBaseHi] = 3u,
         };
         var depth = DecodeDepthTarget(registers);
         System.Diagnostics.Debug.Assert(depth is not null);
@@ -4518,6 +4870,10 @@ public static partial class AgcExports
         System.Diagnostics.Debug.Assert(depth.SwizzleMode == 24u);
         System.Diagnostics.Debug.Assert(depth.Address == 0x0000_0201_2345_6700UL);
         System.Diagnostics.Debug.Assert(depth.ClearDepth == 1f);
+        System.Diagnostics.Debug.Assert(depth.StencilAccess);
+        System.Diagnostics.Debug.Assert(depth.StencilAddress == 0x0000_0302_3456_7800UL);
+        // 1920x1080 stencil uses 256x256 blocks: 2048x1280 bytes.
+        System.Diagnostics.Debug.Assert(depth.StencilSize == 2_621_440UL);
     }
 #endif
 
@@ -5192,7 +5548,9 @@ public static partial class AgcExports
                     // release point, not the immediate payload in ordinal 6/7.
                     3 or 4 => ctx.TryWriteUInt64(
                         destinationAddress,
-                        unchecked((ulong)System.Diagnostics.Stopwatch.GetTimestamp())),
+                        ScaleGpuReferenceClock(
+                            (ulong)System.Diagnostics.Stopwatch.GetTimestamp(),
+                            (ulong)System.Diagnostics.Stopwatch.Frequency)),
                     _ => false,
                 });
 
@@ -5266,7 +5624,9 @@ public static partial class AgcExports
                     // uses the nonzero timestamp as submit-completion state.
                     3 => ctx.TryWriteUInt64(
                         destinationAddress,
-                        unchecked((ulong)System.Diagnostics.Stopwatch.GetTimestamp())),
+                        ScaleGpuReferenceClock(
+                            (ulong)System.Diagnostics.Stopwatch.GetTimestamp(),
+                            (ulong)System.Diagnostics.Stopwatch.Frequency)),
                     _ => false,
                 };
 
@@ -5355,6 +5715,14 @@ public static partial class AgcExports
                 return;
             }
 
+            // libSceAgc interpolant mappings encode their CX destination as
+            // 0x10000000 + slot. Normalize that descriptor shorthand to the
+            // hardware SPI_PS_INPUT_CNTL_n register range before retaining it.
+            if (register == RCxRegsIndirect)
+            {
+                registerOffset = NormalizeIndirectCxRegisterOffset(registerOffset);
+            }
+
             // The indirect table has an explicit count; offset zero is a real
             // context-register index (DB_RENDER_CONTROL), not a terminator.
             // Dropping it leaves stale depth/render-control state active in
@@ -5362,6 +5730,11 @@ public static partial class AgcExports
             destination[registerOffset] = value;
         }
     }
+
+    internal static uint NormalizeIndirectCxRegisterOffset(uint registerOffset) =>
+        registerOffset is >= 0x1000_0000u and <= 0x1000_001Fu
+            ? SpiPsInputCntl0 + (registerOffset - 0x1000_0000u)
+            : registerOffset;
 
     private static bool TryReadSubmittedDrawCount(
         CpuContext ctx,
@@ -6336,7 +6709,8 @@ public static partial class AgcExports
                 renderTargets[index].Width,
                 renderTargets[index].Height,
                 renderTargets[index].Format,
-                renderTargets[index].NumberType);
+                renderTargets[index].NumberType,
+                Samples: renderTargets[index].Samples);
         }
 
         var pixelUserDataCount = Math.Min(pixelEvaluation.InitialScalarRegisters.Count, 8);
@@ -6823,6 +7197,10 @@ public static partial class AgcExports
                 continue;
             }
 
+            // CB_COLORn_ATTRIB is in the per-target 15-register block; older
+            // command streams can omit it, whose architectural reset is 1x.
+            registers.TryGetValue(baseRegister + 5, out var attrib);
+
             var address = ((ulong)(baseHigh & 0xFFu) << 40) | ((ulong)baseLow << 8);
             var writeMask = (targetMask >> ((int)slot * 4)) & 0xFu;
             if (address == 0 ||
@@ -6838,7 +7216,13 @@ public static partial class AgcExports
                 (attrib2 & 0x3FFFu) + 1,
                 (info >> 2) & 0x1Fu,
                 (info >> 8) & 0x7u,
-                (attrib3 >> 14) & 0x1Fu));
+                (attrib3 >> 14) & 0x1Fu,
+                // Native MSAA requires equal sample/fragment counts. Keep
+                // EQAA as single-sample until its distinct resolve rules are
+                // implemented, rather than treating it as ordinary MSAA.
+                ((attrib >> 12) & 0x7u) == ((attrib >> 15) & 0x3u)
+                    ? 1u << (int)((attrib >> 12) & 0x7u)
+                    : 1u));
         }
 
         return targets;
@@ -6855,7 +7239,8 @@ public static partial class AgcExports
             DecodeViewport(registers, target.Width, target.Height, scissor),
             DecodeRasterState(registers),
             DecodeDepthState(registers),
-            DecodeBlendConstant(registers));
+            DecodeBlendConstant(registers),
+            DecodeDepthClipEnabled(registers));
     }
 
     private static GuestRenderState CreateRenderState(
@@ -6889,13 +7274,29 @@ public static partial class AgcExports
             DecodeViewport(registers, target.Width, target.Height, scissor),
             DecodeRasterState(registers),
             DecodeDepthState(registers),
-            DecodeBlendConstant(registers));
+            DecodeBlendConstant(registers),
+            DecodeDepthClipEnabled(registers));
     }
 
     // DB_DEPTH_CONTROL (context register 0x200): Z_ENABLE bit1, Z_WRITE_ENABLE
     // bit2, ZFUNC bits[6:4] (GCN compare, matches Vulkan CompareOp ordering).
     // DB_RENDER_CONTROL (context register 0x000): DEPTH_CLEAR_ENABLE bit0.
     private const uint DbDepthControl = 0x200;
+    private const uint PaClClipCntl = 0x204;
+
+    // Core Vulkan depth clamp represents only the symmetric PS5 ZCLIP disable
+    // case. Preserve ordinary clipping for asymmetric near/far controls.
+    internal static bool DecodeDepthClipEnabled(IReadOnlyDictionary<uint, uint> registers)
+    {
+        if (!registers.TryGetValue(PaClClipCntl, out var clipControl))
+        {
+            return true;
+        }
+
+        var nearDisabled = (clipControl & (1u << 26)) != 0;
+        var farDisabled = (clipControl & (1u << 27)) != 0;
+        return nearDisabled != farDisabled || !nearDisabled;
+    }
 
     internal static GuestDepthState DecodeDepthState(
         IReadOnlyDictionary<uint, uint> registers)
@@ -6940,6 +7341,16 @@ public static partial class AgcExports
         registers.TryGetValue(DbZWriteBaseHi, out var writeBaseHi);
         var readAddress = ((ulong)(readBaseHi & 0xFFu) << 40) | ((ulong)readBase << 8);
         var writeAddress = ((ulong)(writeBaseHi & 0xFFu) << 40) | ((ulong)writeBase << 8);
+        registers.TryGetValue(DbStencilInfo, out var stencilInfo);
+        registers.TryGetValue(DbStencilReadBase, out var stencilReadBase);
+        registers.TryGetValue(DbStencilWriteBase, out var stencilWriteBase);
+        registers.TryGetValue(DbStencilReadBaseHi, out var stencilReadBaseHi);
+        registers.TryGetValue(DbStencilWriteBaseHi, out var stencilWriteBaseHi);
+        var stencilReadAddress = ((ulong)(stencilReadBaseHi & 0xFFu) << 40) | ((ulong)stencilReadBase << 8);
+        var stencilWriteAddress = ((ulong)(stencilWriteBaseHi & 0xFFu) << 40) | ((ulong)stencilWriteBase << 8);
+        var stencilFormat = stencilInfo & 0x3u;
+        var hasStencil = stencilFormat == 1 &&
+            (stencilReadAddress != 0 || stencilWriteAddress != 0);
         if (readAddress == 0 && writeAddress == 0)
         {
             return null;
@@ -6951,6 +7362,16 @@ public static partial class AgcExports
         {
             return null;
         }
+
+        // TileGetDepthSize: PS5 keeps an 8-bit stencil plane as an independent
+        // 64-KiB-block surface (256x256 pixels per block), rather than a tight
+        // width*height allocation. This range is used for subrange aliases.
+        var stencilSize = hasStencil
+            ? checked(AlignUp((ulong)width, 256UL) * AlignUp((ulong)height, 256UL))
+            : 0UL;
+        // DB_Z_INFO.NUM_SAMPLES is a 2-bit log2 sample count. Preserve it
+        // until Vulkan attachment creation can validate host support.
+        var samples = 1u << (int)((zInfo >> 2) & 0x3u);
 
         registers.TryGetValue(DbDepthView, out var depthView);
         var clearDepth = registers.TryGetValue(DbDepthClear, out var clearBits)
@@ -6969,14 +7390,24 @@ public static partial class AgcExports
             guestFormat,
             (zInfo >> 4) & 0x1Fu,
             clearDepth,
-            ReadOnly: (depthView & (1u << 24)) != 0 || writeAddress == 0);
+            ReadOnly: (depthView & (1u << 24)) != 0 || writeAddress == 0,
+            StencilReadAddress: stencilReadAddress,
+            StencilWriteAddress: stencilWriteAddress,
+            StencilSize: stencilSize,
+            StencilAccess: hasStencil,
+            Samples: samples);
     }
 
     // PA_SU_SC_MODE_CNTL (context register 0x205) carries face culling, the
     // front-face winding and polygon (wireframe) mode.
     private const uint PaSuScModeCntl = 0x205;
+    private const uint PaSuPolyOffsetClamp = 0x2DF;
+    private const uint PaSuPolyOffsetFrontScale = 0x2E0;
+    private const uint PaSuPolyOffsetFrontOffset = 0x2E1;
+    private const uint PaSuPolyOffsetBackScale = 0x2E2;
+    private const uint PaSuPolyOffsetBackOffset = 0x2E3;
 
-    private static GuestRasterState DecodeRasterState(
+    internal static GuestRasterState DecodeRasterState(
         IReadOnlyDictionary<uint, uint> registers)
     {
         if (!registers.TryGetValue(PaSuScModeCntl, out var mode))
@@ -6991,7 +7422,27 @@ public static partial class AgcExports
         var frontPtype = (mode >> 5) & 0x7u;
         // POLY_MODE != 0 with a line front primitive type renders wireframe.
         var wireframe = polyMode != 0 && frontPtype == 1;
-        return new GuestRasterState(cullFront, cullBack, frontFaceClockwise, wireframe);
+        var frontDepthBias = (mode & (1u << 11)) != 0;
+        var backDepthBias = (mode & (1u << 12)) != 0;
+        var useFrontBias = frontDepthBias || !backDepthBias;
+        var scaleRegister = useFrontBias
+            ? PaSuPolyOffsetFrontScale
+            : PaSuPolyOffsetBackScale;
+        var offsetRegister = useFrontBias
+            ? PaSuPolyOffsetFrontOffset
+            : PaSuPolyOffsetBackOffset;
+        registers.TryGetValue(scaleRegister, out var slopeFactor);
+        registers.TryGetValue(offsetRegister, out var constantFactor);
+        registers.TryGetValue(PaSuPolyOffsetClamp, out var clamp);
+        return new GuestRasterState(
+            cullFront,
+            cullBack,
+            frontFaceClockwise,
+            wireframe,
+            DepthBiasEnable: frontDepthBias || backDepthBias,
+            DepthBiasConstantFactor: BitConverter.Int32BitsToSingle(unchecked((int)constantFactor)),
+            DepthBiasClamp: BitConverter.Int32BitsToSingle(unchecked((int)clamp)),
+            DepthBiasSlopeFactor: BitConverter.Int32BitsToSingle(unchecked((int)slopeFactor)));
     }
 
     /// <summary>CB_BLEND_RED..ALPHA carry the constant blend color as raw
@@ -8094,7 +8545,9 @@ public static partial class AgcExports
                 Pitch: sourceWidth,
                 TileMode: descriptor.TileMode,
                 DstSelect: descriptor.DstSelect,
-                Sampler: ToGuestSampler(samplerDescriptor));
+                Sampler: ToGuestSampler(samplerDescriptor),
+                ArrayedView: isArrayed,
+                ArrayLayers: descriptor.Depth);
             return true;
         }
 
@@ -10977,6 +11430,32 @@ public static partial class AgcExports
         }
 
         value = BinaryPrimitives.ReadUInt32LittleEndian(buffer);
+        return true;
+    }
+
+    private static bool TryReadUInt16(CpuContext ctx, ulong address, out ushort value)
+    {
+        Span<byte> buffer = stackalloc byte[sizeof(ushort)];
+        if (!ctx.Memory.TryRead(address, buffer))
+        {
+            value = 0;
+            return false;
+        }
+
+        value = BinaryPrimitives.ReadUInt16LittleEndian(buffer);
+        return true;
+    }
+
+    private static bool TryReadInt16(CpuContext ctx, ulong address, out short value)
+    {
+        Span<byte> buffer = stackalloc byte[sizeof(short)];
+        if (!ctx.Memory.TryRead(address, buffer))
+        {
+            value = 0;
+            return false;
+        }
+
+        value = BinaryPrimitives.ReadInt16LittleEndian(buffer);
         return true;
     }
 

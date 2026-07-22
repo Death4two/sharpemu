@@ -33,6 +33,12 @@ public sealed class VideoOutPixelFormatTests
     }
 
     [Fact]
+    public void GetBytesPerPixel_KytyRgba16Float_Returns8()
+    {
+        Assert.Equal(8u, InvokeGetBytesPerPixel(0xC001000600000000UL));
+    }
+
+    [Fact]
     public void GetBytesPerPixel_UnknownFormat_Returns0()
     {
         Assert.Equal(0u, InvokeGetBytesPerPixel(0x00000000UL));
@@ -86,6 +92,13 @@ public sealed class VideoOutPixelFormatTests
         Assert.Equal(9u, InvokeMapPixelFormat(0x88060000UL));
         Assert.Equal(9u, InvokeMapPixelFormat(0x8100000622000000UL));
         Assert.Equal(9u, InvokeMapPixelFormat(0x8100070422000000UL));
+    }
+
+    [Fact]
+    public void MapPixelFormat_KytyRgba16Float_Returns71()
+    {
+        // Kyty decodes this VideoOut format2 value as BufferFormat::k16_16_16_16Float.
+        Assert.Equal(71u, InvokeMapPixelFormat(0xC001000600000000UL));
     }
 
     [Fact]

@@ -34,6 +34,20 @@ internal readonly record struct VulkanRenderTargetFormat(
     public bool IsInteger => OutputKind is Gen5PixelOutputKind.Uint or Gen5PixelOutputKind.Sint;
 }
 
+// Render targets may be display-scaled, while storage images must retain
+// native guest dimensions because shader image coordinates address them
+// directly. Both representations can describe the same guest allocation, but
+// they cannot share a Vulkan image.
+internal readonly record struct GuestImageVariantKey(
+    ulong Address,
+    uint Width,
+    uint Height,
+    uint MipLevels,
+    uint GuestFormat,
+    Format Format,
+    bool StorageSized,
+    uint Samples = 1);
+
 internal sealed record VulkanTranslatedGuestDraw(
     byte[] VertexSpirv,
     byte[] PixelSpirv,
@@ -97,6 +111,14 @@ internal readonly record struct VulkanGuestQueueIdentity(
     ulong SubmissionId)
 {
     public static VulkanGuestQueueIdentity Default { get; } = new("host.default", 0);
+}
+
+// A deferred guest wait must yield to already queued producers. Keeping this
+// tiny policy separate makes the FIFO requirement independently testable.
+internal static class VulkanGuestQueueScheduling
+{
+    internal static void RequeueDeferredWork<T>(LinkedList<T> queue, T work) =>
+        queue.AddLast(work);
 }
 
 internal static unsafe class VulkanVideoPresenter
@@ -412,6 +434,15 @@ internal static unsafe class VulkanVideoPresenter
         ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_FENCE_WAIT_TIMEOUT_MS"), out var fenceMs) && fenceMs > 0
             ? fenceMs * 1_000_000UL
             : 3_000_000_000UL;
+    // Ordered guest callbacks consume CPU-visible writes from their preceding
+    // guest submission. A pure zero-time poll requeues every such callback on
+    // a fast Windows render thread and can build a 512-item callback storm
+    // before the GPU gets a scheduling slice. Yield a bounded slice there;
+    // macOS keeps its event-loop-friendly nonblocking behavior.
+    private static readonly ulong _orderedActionVisibilityWaitNs =
+        ulong.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_ORDERED_ACTION_WAIT_MS"), out var orderedWaitMs)
+            ? orderedWaitMs * 1_000_000UL
+            : OperatingSystem.IsMacOS() ? 0UL : 1_000_000UL;
     // When making room in the in-flight submission queue from the macOS MAIN
     // thread (Render() -> guest-work drain), block only this long per attempt
     // instead of the full fence timeout. If a slow/capped compute submission
@@ -2335,6 +2366,9 @@ internal static unsafe class VulkanVideoPresenter
                         $"incoming_mb={payloadBytes / (1024 * 1024)} " +
                         $"budget_mb={_maxPendingGuestWorkBytes / (1024 * 1024)} " +
                         $"work={work.GetType().Name}" +
+                        (work is VulkanOrderedGuestAction orderedAction
+                            ? $" name='{orderedAction.DebugName}'"
+                            : string.Empty) +
                         GetGuestWorkPayloadBreakdown(work));
                 }
             }
@@ -2518,7 +2552,7 @@ internal static unsafe class VulkanVideoPresenter
         }
     }
 
-    private static bool RequeueGuestWorkFront(in PendingGuestWork work)
+    private static bool RequeueGuestWorkBack(in PendingGuestWork work)
     {
         lock (_gate)
         {
@@ -2537,7 +2571,15 @@ internal static unsafe class VulkanVideoPresenter
             // TryTakeGuestWork removes only the item count. Payload ownership
             // remains live until CompleteGuestWork, so requeueing must not add
             // the retained-byte total a second time.
-            queue.AddFirst(work);
+            //
+            // A deferred ordered action is normally a guest WAIT_REG_MEM. Its
+            // condition can be produced by work submitted later on this logical
+            // queue (for example after an asynchronous compute submission).
+            // Requeueing it at the front would schedule that waiter again on
+            // the next render tick and starve its producer forever. Keep the
+            // unfinished action, but yield to the already queued suffix; the
+            // condition is rechecked immediately before the action executes.
+            VulkanGuestQueueScheduling.RequeueDeferredWork(queue, work);
             _pendingGuestWorkCount++;
             System.Threading.Monitor.PulseAll(_gate);
             return true;
@@ -2731,6 +2773,94 @@ internal static unsafe class VulkanVideoPresenter
         target is not null &&
         (state.TestEnable || state.WriteEnable || state.ClearEnable);
 
+    // Prospero DB_Z_INFO encodes Z16 as 1 and Z32_FLOAT as 3. Keep the
+    // allocation typed: a D32 image cannot faithfully represent a D16 target
+    // when the guest later reinterprets the same allocation as R16_UNORM.
+    internal static Format GetDepthFormat(uint guestFormat) => guestFormat switch
+    {
+        1 => Format.D16Unorm,
+        3 => Format.D32Sfloat,
+        _ => Format.D32Sfloat,
+    };
+
+    /// <summary>Maps the PS5's decoded attachment count to Vulkan's native flag.</summary>
+    internal static bool TryGetVulkanSampleCount(uint samples, out SampleCountFlags sampleCount)
+    {
+        sampleCount = samples switch
+        {
+            1 => SampleCountFlags.Count1Bit,
+            2 => SampleCountFlags.Count2Bit,
+            4 => SampleCountFlags.Count4Bit,
+            8 => SampleCountFlags.Count8Bit,
+            _ => 0,
+        };
+        return sampleCount != 0;
+    }
+
+    // A Z16 target may be rebound as a single-level R16_UNORM storage image.
+    // Keep this deliberately exact: wider/mipped/array descriptors are distinct
+    // resources, even if they begin at the same guest address.
+    internal static bool IsD16DepthStorageAlias(
+        GuestDepthTarget depth,
+        GuestDrawTexture storage) =>
+        depth.GuestFormat == 1 &&
+        !depth.StencilAccess &&
+        depth.StencilSize == 0 &&
+        // A storage image is single-sampled.  Do not route an MSAA depth
+        // surface through the 1x depth-to-R16 copy bridge.
+        depth.Samples == 1 &&
+        storage.IsStorage &&
+        storage.Address == depth.Address &&
+        storage.Format == 2 &&
+        storage.NumberType == 0 &&
+        storage.TileMode == 24 &&
+        storage.Width == depth.Width &&
+        storage.Height == depth.Height &&
+        storage.Pitch == depth.Width &&
+        storage.MipLevels == 1 &&
+        storage.ResourceMipLevels == 1 &&
+        storage.BaseMipLevel == 0 &&
+        storage.MipLevel == 0 &&
+        storage.ArrayedView &&
+        storage.ArrayLayers == 1 &&
+        depth.SwizzleMode == 24;
+
+    // Match the guest depth-descriptor path: only a depth-tiled sampled
+    // descriptor may be serviced by a DB image.  In particular, do not let an
+    // unrelated colour texture at a reused address accidentally sample the
+    // typed depth image.  Vulkan samples D16/D32 through their depth aspect;
+    // the guest R16_UNORM/R32_SFLOAT descriptor expresses the corresponding
+    // numeric interpretation, not a colour-image view requirement.
+    internal static bool IsSupportedSampledDepthAlias(
+        GuestDepthTarget depth,
+        GuestDrawTexture texture) =>
+        !texture.IsStorage &&
+        // The translated sampled-image declarations are single-sampled;
+        // multisample DB surfaces need a dedicated resolve/samplerMS path.
+        depth.Samples == 1 &&
+        texture.Address != 0 &&
+        (texture.Address == depth.Address ||
+         texture.Address == depth.ReadAddress ||
+         texture.Address == depth.WriteAddress) &&
+        texture.Width <= depth.Width &&
+        texture.Height <= depth.Height &&
+        texture.TileMode == 24 &&
+        depth.SwizzleMode == 24 &&
+        texture.MipLevels == 1 &&
+        texture.ResourceMipLevels == 1 &&
+        texture.BaseMipLevel == 0 &&
+        texture.MipLevel == 0 &&
+        texture.ArrayLayers <= 1 &&
+        (depth.GuestFormat, texture.Format, texture.NumberType) switch
+        {
+            (1, 2, 0) => IsSupportedDepthSampleSwizzle(texture.DstSelect),
+            (3, 4, 7) => IsSupportedDepthSampleSwizzle(texture.DstSelect),
+            _ => false,
+        };
+
+    private static bool IsSupportedDepthSampleSwizzle(uint dstSelect) =>
+        dstSelect is 0x924 or 0x204 or 0x004;
+
     private readonly record struct Presentation(
         byte[]? Pixels,
         uint Width,
@@ -2776,7 +2906,10 @@ internal static unsafe class VulkanVideoPresenter
         private uint _maxComputeWorkGroupInvocations;
         private ulong _minStorageBufferOffsetAlignment = 1;
         private bool _supportsIndependentBlend;
+        private bool _supportsDepthClamp;
         private uint _maxColorAttachments;
+        private SampleCountFlags _framebufferColorSampleCounts = SampleCountFlags.Count1Bit;
+        private SampleCountFlags _framebufferDepthSampleCounts = SampleCountFlags.Count1Bit;
         private Device _device;
         private PipelineCache _pipelineCache;
         private string? _pipelineCachePath;
@@ -2863,14 +2996,6 @@ internal static unsafe class VulkanVideoPresenter
         private int _directPresentationCount;
         private readonly Dictionary<ulong, long> _presentedGuestImageTraceCounts = new();
         private readonly Dictionary<ulong, GuestImageResource> _guestImages = new();
-        private readonly record struct GuestImageVariantKey(
-            ulong Address,
-            uint Width,
-            uint Height,
-            uint MipLevels,
-            uint GuestFormat,
-            Format Format);
-
         // A single guest allocation may be rebound through several RT descriptors.
         // Keep the inactive Vulkan images instead of destroying their contents each
         // time the guest switches size or format at the same address.
@@ -2881,10 +3006,13 @@ internal static unsafe class VulkanVideoPresenter
         private readonly record struct GuestDepthKey(
             ulong Address,
             ulong ReadAddress,
+            ulong StencilAddress,
+            ulong StencilSize,
             uint Width,
             uint Height,
             uint GuestFormat,
-            uint SwizzleMode);
+            uint SwizzleMode,
+            uint Samples);
 
         private readonly Dictionary<GuestDepthKey, GuestDepthResource> _guestDepthImages = new();
         private readonly Dictionary<GuestDepthKey, ulong> _depthOnlyColorAddresses = new();
@@ -2934,12 +3062,15 @@ internal static unsafe class VulkanVideoPresenter
             string FragmentShader,
             string RenderTargetLayout,
             bool HasDepthAttachment,
+            Format DepthAttachmentFormat,
             PrimitiveTopology Topology,
             string BlendLayout,
             string ResourceLayout,
             string VertexLayout,
             GuestRasterState Raster,
-            GuestDepthState Depth);
+            GuestDepthState Depth,
+            bool DepthClipEnabled,
+            SampleCountFlags Samples);
 
         private readonly record struct DescriptorLayoutKey(
             ShaderStageFlags Stages,
@@ -3001,6 +3132,13 @@ internal static unsafe class VulkanVideoPresenter
             public GuestViewport? Viewport;
             public GuestRasterState Raster = GuestRasterState.Default;
             public GuestDepthState Depth = GuestDepthState.Default;
+            // Render-pass compatibility includes the depth/stencil attachment
+            // format. Pipelines cached only by HasDepthAttachment can bind a
+            // D16 pipeline inside a D32 render pass (or vice versa), which is
+            // invalid Vulkan and drops the draw.
+            public Format DepthAttachmentFormat = Format.Undefined;
+            public bool DepthClipEnabled = true;
+            public SampleCountFlags Samples = SampleCountFlags.Count1Bit;
             public bool HasDepthAttachment;
             // Layout keys are needed twice per draw (pipeline lookup and
             // descriptor-layout lookup); cache the built strings.
@@ -3008,6 +3146,7 @@ internal static unsafe class VulkanVideoPresenter
             public string? VertexLayoutKey;
             public RenderPass TransientRenderPass;
             public Framebuffer TransientFramebuffer;
+            public List<(VkBuffer Buffer, DeviceMemory Memory)> AliasTransferBuffers { get; } = [];
         }
 
         private sealed class TextureResource
@@ -3044,6 +3183,10 @@ internal static unsafe class VulkanVideoPresenter
             // this TextureResource and retires with the draw fence.
             public GuestImageResource? FeedbackSource;
             public GuestDepthResource? DepthFeedbackSource;
+            // Exact D16 -> R16 storage reinterpretation. The source remains
+            // a typed depth attachment; its contents are copied to the
+            // independent storage image before the shader accesses it.
+            public GuestDepthResource? DepthStorageSource;
         }
 
         private sealed class GlobalBufferResource
@@ -3079,8 +3222,6 @@ internal static unsafe class VulkanVideoPresenter
             public uint OffsetBytes;
         }
 
-        private const Format DepthFormat = Format.D32Sfloat;
-
         private sealed class GuestDepthResource
         {
             public GuestDepthKey Key;
@@ -3093,15 +3234,20 @@ internal static unsafe class VulkanVideoPresenter
             public uint LogicalWidth;
             public uint LogicalHeight;
             public uint GuestFormat;
+            public Format Format;
             public uint SwizzleMode;
+            public uint Samples = 1;
             public Image Image;
             public DeviceMemory Memory;
             public ImageView View;
-            public Dictionary<uint, ImageView> SampleViews { get; } = new();
+            public Dictionary<(uint DstSelect, bool ArrayedView), ImageView> SampleViews { get; } = new();
             public bool Initialized;
             public ImageLayout Layout = ImageLayout.Undefined;
             public float GuestClearDepth = 1f;
             public float ClearDepth = 1f;
+            // Incremented whenever a depth clear/draw publishes newer depth
+            // contents. R16 storage aliases copy only on a version change.
+            public ulong ContentVersion = 1;
             public string InitializationSource = "none";
         }
 
@@ -3125,12 +3271,21 @@ internal static unsafe class VulkanVideoPresenter
             public uint LogicalWidth;
             public uint LogicalHeight;
             public uint MipLevels;
+            public uint Samples = 1;
             public uint GuestFormat;
             public Format Format;
             public Image Image;
             public DeviceMemory Memory;
             public ImageView View;
             public ImageView[] MipViews = [];
+            // For MSAA targets Image/View remain the single-sample resolve
+            // resource consumed by sampling, readback, and guest publication.
+            public Image MsaaImage;
+            public DeviceMemory MsaaMemory;
+            public ImageView MsaaView;
+            // Resolve-image initialization (for sampling/readback) is distinct
+            // from native per-sample attachment initialization.
+            public bool MsaaInitialized;
             public Dictionary<(Format Format, uint MipLevel, uint LevelCount, uint DstSelect), ImageView> FormatViews { get; } = new();
             public RenderPass RenderPass;
             public RenderPass InitialRenderPass;
@@ -3141,6 +3296,18 @@ internal static unsafe class VulkanVideoPresenter
             public bool IsCpuBacked;
             public ulong CpuContentFingerprint;
             public bool SupportsStorageUsage;
+            public bool StorageSized;
+            // Original guest backing details for GPU->guest publication when
+            // this storage view is replaced by a differently sized RT.
+            public uint GuestPitch;
+            public uint GuestTileMode;
+            public uint GuestBytesPerElement;
+            public ulong GuestBackingSize;
+            public ulong DepthAliasSourceVersion;
+            // A same-address native-sized storage image replaced by an exact
+            // render-target variant. Its GPU contents must be copied before
+            // the new attachment first loads them.
+            public GuestImageResource? StorageAliasSource;
         }
 
         private sealed record PendingGuestSubmission(
@@ -3892,9 +4059,14 @@ internal static unsafe class VulkanVideoPresenter
             LoadComputeDeviceLimits();
             _vk.GetPhysicalDeviceProperties(_physicalDevice, out var selected);
             _maxColorAttachments = selected.Limits.MaxColorAttachments;
+            _framebufferColorSampleCounts = selected.Limits.FramebufferColorSampleCounts;
+            _framebufferDepthSampleCounts = selected.Limits.FramebufferDepthSampleCounts;
             var selectedName = SilkMarshal.PtrToString((nint)selected.DeviceName) ?? "unknown";
             Console.Error.WriteLine(
                 $"[LOADER][INFO] Vulkan device: {selectedName} ({selected.DeviceType})");
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] Vulkan attachment samples: color={_framebufferColorSampleCounts} " +
+                $"depth={_framebufferDepthSampleCounts}");
             VideoOutExports.SetSelectedGpuName(selectedName);
             if (_window is not null)
             {
@@ -3967,6 +4139,7 @@ internal static unsafe class VulkanVideoPresenter
             };
             _vk.GetPhysicalDeviceFeatures(_physicalDevice, out var supportedFeatures);
             _supportsIndependentBlend = supportedFeatures.IndependentBlend;
+            _supportsDepthClamp = supportedFeatures.DepthClamp;
             var enabledFeatures = new PhysicalDeviceFeatures
             {
                 IndependentBlend = supportedFeatures.IndependentBlend,
@@ -3978,6 +4151,7 @@ internal static unsafe class VulkanVideoPresenter
                 ShaderStorageImageReadWithoutFormat = supportedFeatures.ShaderStorageImageReadWithoutFormat,
                 ShaderStorageImageWriteWithoutFormat = supportedFeatures.ShaderStorageImageWriteWithoutFormat,
                 RobustBufferAccess = supportedFeatures.RobustBufferAccess,
+                DepthClamp = supportedFeatures.DepthClamp,
             };
 
             if (!supportedFeatures.RobustBufferAccess)
@@ -5123,7 +5297,21 @@ internal static unsafe class VulkanVideoPresenter
             var status = _vk.GetFenceStatus(_device, fence);
             if (status == Result.NotReady)
             {
-                return false;
+                if (_orderedActionVisibilityWaitNs == 0)
+                {
+                    return false;
+                }
+
+                status = _vk.WaitForFences(
+                    _device,
+                    1,
+                    &fence,
+                    true,
+                    _orderedActionVisibilityWaitNs);
+                if (status == Result.Timeout)
+                {
+                    return false;
+                }
             }
 
             if (status == Result.ErrorDeviceLost)
@@ -5937,7 +6125,9 @@ internal static unsafe class VulkanVideoPresenter
             Extent2D extent,
             IReadOnlyList<GuestImageResource>? feedbackTargets = null,
             bool hasDepthAttachment = false,
-            GuestDepthResource? feedbackDepth = null)
+            GuestDepthResource? feedbackDepth = null,
+            Format depthAttachmentFormat = Format.Undefined,
+            SampleCountFlags samples = SampleCountFlags.Count1Bit)
         {
             var isTitleDraw = IsTitleDraw(draw.VertexBuffers);
             var forceFullscreenVertex = _forceFullscreenPipeline ||
@@ -6010,7 +6200,12 @@ internal static unsafe class VulkanVideoPresenter
                 Viewport = draw.RenderState.Viewport,
                 Raster = draw.RenderState.Raster,
                 Depth = draw.RenderState.Depth,
+                DepthAttachmentFormat = hasDepthAttachment
+                    ? depthAttachmentFormat
+                    : Format.Undefined,
+                DepthClipEnabled = draw.RenderState.DepthClipEnabled,
                 HasDepthAttachment = hasDepthAttachment,
+                Samples = samples,
                 TargetFormats = renderTargetFormats.ToArray(),
             };
             if (forceFullscreenVertex)
@@ -6028,6 +6223,7 @@ internal static unsafe class VulkanVideoPresenter
                 resources.Viewport = null;
                 resources.Raster = GuestRasterState.Default;
                 resources.Depth = GuestDepthState.Default;
+                resources.DepthClipEnabled = true;
             }
             if (isTitleDraw && _forceTitleDefaultBlend)
             {
@@ -6505,6 +6701,7 @@ internal static unsafe class VulkanVideoPresenter
                 GetShaderDigest(fragmentSpirv),
                 string.Join(',', renderTargetFormats.Select(format => (uint)format)),
                 resources.HasDepthAttachment,
+                resources.DepthAttachmentFormat,
                 resources.Topology,
                 string.Join(';', resources.Blends.Select(blend =>
                     $"{(blend.Enable ? 1 : 0)}:{blend.ColorSrcFactor}:{blend.ColorDstFactor}:" +
@@ -6513,7 +6710,9 @@ internal static unsafe class VulkanVideoPresenter
                 GetResourceLayoutKey(resources),
                 GetVertexLayoutKey(resources),
                 resources.Raster,
-                resources.HasDepthAttachment ? resources.Depth : GuestDepthState.Default);
+                resources.HasDepthAttachment ? resources.Depth : GuestDepthState.Default,
+                resources.DepthClipEnabled && _supportsDepthClamp,
+                resources.Samples);
             if (_graphicsPipelines.TryGetValue(pipelineKey, out var cachedPipeline))
             {
                 resources.Pipeline = cachedPipeline;
@@ -6630,12 +6829,14 @@ internal static unsafe class VulkanVideoPresenter
                         FrontFace = raster.FrontFaceClockwise
                             ? FrontFace.Clockwise
                             : FrontFace.CounterClockwise,
+                        DepthClampEnable = !resources.DepthClipEnabled && _supportsDepthClamp,
+                        DepthBiasEnable = raster.DepthBiasEnable,
                         LineWidth = 1,
                     };
                     var multisample = new PipelineMultisampleStateCreateInfo
                     {
                         SType = StructureType.PipelineMultisampleStateCreateInfo,
-                        RasterizationSamples = SampleCountFlags.Count1Bit,
+                        RasterizationSamples = resources.Samples,
                     };
                     var colorBlendAttachments = stackalloc PipelineColorBlendAttachmentState[resources.Blends.Length];
                     for (var index = 0; index < resources.Blends.Length; index++)
@@ -6666,12 +6867,13 @@ internal static unsafe class VulkanVideoPresenter
                         AttachmentCount = (uint)resources.Blends.Length,
                         PAttachments = colorBlendAttachments,
                     };
-                    var dynamicStateValues = stackalloc DynamicState[3];
+                    var dynamicStateValues = stackalloc DynamicState[4];
                     dynamicStateValues[0] = DynamicState.Viewport;
                     dynamicStateValues[1] = DynamicState.Scissor;
                     // CB_BLEND_RED..ALPHA vary per draw without a pipeline
                     // identity change, so the constant stays dynamic.
                     dynamicStateValues[2] = DynamicState.BlendConstants;
+                    dynamicStateValues[3] = DynamicState.DepthBias;
                     var dynamicState = new PipelineDynamicStateCreateInfo
                     {
                         SType = StructureType.PipelineDynamicStateCreateInfo,
@@ -7214,26 +7416,31 @@ internal static unsafe class VulkanVideoPresenter
         {
             foreach (var depth in _guestDepthImages.Values)
             {
-                if (texture.Address != depth.Address &&
-                    texture.Address != depth.ReadAddress &&
-                    texture.Address != depth.WriteAddress)
+                var target = new GuestDepthTarget(
+                    depth.ReadAddress,
+                    depth.WriteAddress,
+                    depth.LogicalWidth,
+                    depth.LogicalHeight,
+                    depth.GuestFormat,
+                    depth.Key.SwizzleMode,
+                    ClearDepth: 1f,
+                    ReadOnly: false);
+                if (!IsSupportedSampledDepthAlias(target, texture))
                 {
                     continue;
                 }
 
-                if (texture.Width > depth.LogicalWidth || texture.Height > depth.LogicalHeight)
-                {
-                    continue;
-                }
-
-                if (!depth.SampleViews.TryGetValue(texture.DstSelect, out var view))
+                var viewKey = (texture.DstSelect, texture.ArrayedView);
+                if (!depth.SampleViews.TryGetValue(viewKey, out var view))
                 {
                     var viewInfo = new ImageViewCreateInfo
                     {
                         SType = StructureType.ImageViewCreateInfo,
                         Image = depth.Image,
-                        ViewType = ImageViewType.Type2D,
-                        Format = DepthFormat,
+                        ViewType = texture.ArrayedView
+                            ? ImageViewType.Type2DArray
+                            : ImageViewType.Type2D,
+                        Format = depth.Format,
                         Components = ToVkComponentMapping(texture.DstSelect),
                         SubresourceRange = new ImageSubresourceRange(
                             ImageAspectFlags.DepthBit,
@@ -7249,8 +7456,8 @@ internal static unsafe class VulkanVideoPresenter
                         ObjectType.ImageView,
                         view.Handle,
                         $"SharpEmu guest depth sample 0x{depth.Address:X16} " +
-                        $"dst=0x{texture.DstSelect:X3}");
-                    depth.SampleViews.Add(texture.DstSelect, view);
+                        $"dst=0x{texture.DstSelect:X3} array={texture.ArrayedView}");
+                    depth.SampleViews.Add(viewKey, view);
                 }
 
                 if (_tracedDepthTextureAliases.Add(
@@ -7472,7 +7679,8 @@ internal static unsafe class VulkanVideoPresenter
                 guestImage,
                 vkFormat,
                 selectedMipLevel,
-                levelCount: 1);
+                levelCount: 1,
+                arrayedView: texture.ArrayedView);
             var resource = new TextureResource
             {
                 Address = texture.Address,
@@ -7485,9 +7693,11 @@ internal static unsafe class VulkanVideoPresenter
                 IsStorage = true,
                 SamplerState = texture.Sampler,
                 GuestImage = guestImage,
+                DepthStorageSource = FindD16DepthStorageAlias(texture),
             };
 
-            if (!guestImage.Initialized &&
+            if (resource.DepthStorageSource is null &&
+                !guestImage.Initialized &&
                 !guestImage.InitialUploadPending &&
                 texture.MipLevel == 0)
             {
@@ -7539,6 +7749,31 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             return resource;
+        }
+
+        private GuestDepthResource? FindD16DepthStorageAlias(GuestDrawTexture texture)
+        {
+            foreach (var depth in _guestDepthImages.Values)
+            {
+                if (IsD16DepthStorageAlias(
+                        new GuestDepthTarget(
+                            depth.ReadAddress,
+                            depth.WriteAddress,
+                            depth.LogicalWidth,
+                            depth.LogicalHeight,
+                            depth.GuestFormat,
+                            depth.SwizzleMode,
+                            depth.GuestClearDepth,
+                            ReadOnly: depth.WriteAddress == 0),
+                        texture) &&
+                    depth.Width == texture.Width &&
+                    depth.Height == texture.Height)
+                {
+                    return depth;
+                }
+            }
+
+            return null;
         }
 
         private TextureResource CreateStorageScratchResource(GuestDrawTexture texture)
@@ -7661,6 +7896,10 @@ internal static unsafe class VulkanVideoPresenter
                     texture.ResourceMipLevels),
                 format,
                 requiresStorage: true);
+            guestImage.GuestPitch = Math.Max(texture.Pitch, texture.Width);
+            guestImage.GuestTileMode = texture.TileMode;
+            guestImage.GuestBytesPerElement = checked((uint)GetTextureBytesPerPixel(texture.Format));
+            guestImage.GuestBackingSize = (ulong)texture.RgbaPixels.Length;
             var selectedMipLevel = GetStorageMipLevel(texture);
             if (selectedMipLevel >= guestImage.MipLevels)
             {
@@ -7737,8 +7976,6 @@ internal static unsafe class VulkanVideoPresenter
                 $"{TextureDebugName(texture, vkFormat)} staging");
 
             var supportsAttachmentUsage = !IsBlockCompressedFormat(vkFormat);
-            var supportsStorageUsage = supportsAttachmentUsage &&
-                SupportsStorageImage(vkFormat);
             var imageInfo = new ImageCreateInfo
             {
                 SType = StructureType.ImageCreateInfo,
@@ -7756,7 +7993,6 @@ internal static unsafe class VulkanVideoPresenter
                     ? ImageUsageFlags.TransferDstBit |
                       ImageUsageFlags.SampledBit |
                       ImageUsageFlags.ColorAttachmentBit |
-                      (supportsStorageUsage ? ImageUsageFlags.StorageBit : (ImageUsageFlags)0) |
                       ImageUsageFlags.TransferSrcBit
                     : ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit,
                 SharingMode = SharingMode.Exclusive,
@@ -7833,7 +8069,7 @@ internal static unsafe class VulkanVideoPresenter
                     InitialUploadPending = true,
                     IsCpuBacked = true,
                     CpuContentFingerprint = contentFingerprint,
-                    SupportsStorageUsage = supportsStorageUsage,
+                    SupportsStorageUsage = false,
                 };
                 _guestImages.Add(texture.Address, guestImage);
                 resource.OwnsStorage = false;
@@ -8056,7 +8292,7 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     SType = StructureType.ImageCreateInfo,
                     ImageType = ImageType.Type2D,
-                    Format = DepthFormat,
+                    Format = source.Format,
                     Extent = new Extent3D(source.Width, source.Height, 1),
                     MipLevels = 1,
                     ArrayLayers = 1,
@@ -8089,7 +8325,7 @@ internal static unsafe class VulkanVideoPresenter
                     SType = StructureType.ImageViewCreateInfo,
                     Image = image,
                     ViewType = ImageViewType.Type2D,
-                    Format = DepthFormat,
+                    Format = source.Format,
                     Components = ToVkComponentMapping(texture.DstSelect),
                     SubresourceRange = new ImageSubresourceRange(
                         ImageAspectFlags.DepthBit,
@@ -9666,6 +9902,7 @@ internal static unsafe class VulkanVideoPresenter
                             resources,
                             PipelineStageFlags.ComputeShaderBit);
                         RecordTextureUploads(resources, PipelineStageFlags.ComputeShaderBit);
+                        RecordD16DepthStorageAliases(resources, PipelineStageFlags.ComputeShaderBit);
                         RecordStorageImagesForWrite(resources, PipelineStageFlags.ComputeShaderBit);
                     }
                     else
@@ -10629,11 +10866,14 @@ internal static unsafe class VulkanVideoPresenter
                     };
                 }
 
+                var firstColorInitialized = firstTarget.MsaaImage.Handle != 0
+                    ? firstTarget.MsaaInitialized
+                    : firstTarget.Initialized;
                 var renderPass = depthFramebuffer is null
-                    ? firstTarget.Initialized
+                    ? firstColorInitialized
                         ? firstTarget.RenderPass
                         : firstTarget.InitialRenderPass
-                    : firstTarget.Initialized
+                    : firstColorInitialized
                         ? depth!.Initialized && !clearDepthForDraw
                             ? depthFramebuffer.LoadRenderPass
                             : depthFramebuffer.DepthClearRenderPass
@@ -10644,17 +10884,21 @@ internal static unsafe class VulkanVideoPresenter
                 if (targets.Length > 1)
                 {
                     var attachedDepth = clearDepthSeparately ? null : depth;
-                    (renderPass, framebuffer) = CreateRenderPassAndFramebuffer(
-                        formats,
-                        targets.Select(target => target.MipViews.Length > 0
-                            ? target.MipViews[0]
-                            : target.View).ToArray(),
-                        extent.Width,
-                        extent.Height,
-                        targets.Select(target =>
-                            target.Initialized || target.InitialUploadPending).ToArray(),
-                        attachedDepth,
-                        attachedDepth?.Initialized == true && !clearDepthForDraw);
+                    (renderPass, framebuffer) = targets.Any(target => target.MsaaImage.Handle != 0)
+                        ? CreateMsaaMrtRenderPassAndFramebuffer(
+                            targets, formats, extent.Width, extent.Height, attachedDepth,
+                            attachedDepth?.Initialized == true && !clearDepthForDraw)
+                        : CreateRenderPassAndFramebuffer(
+                            formats,
+                            targets.Select(target => target.MipViews.Length > 0
+                                ? target.MipViews[0]
+                                : target.View).ToArray(),
+                            extent.Width,
+                            extent.Height,
+                            targets.Select(target =>
+                                target.Initialized || target.InitialUploadPending).ToArray(),
+                            attachedDepth,
+                            attachedDepth?.Initialized == true && !clearDepthForDraw);
                     transientRenderPass = renderPass;
                     transientFramebuffer = framebuffer;
                 }
@@ -10666,7 +10910,13 @@ internal static unsafe class VulkanVideoPresenter
                     extent,
                     targets,
                     hasDepthAttachment: depth is not null && !clearDepthSeparately,
-                    feedbackDepth: clearDepthSeparately ? null : depth);
+                    feedbackDepth: clearDepthSeparately ? null : depth,
+                    depthAttachmentFormat: clearDepthSeparately || depth is null
+                        ? Format.Undefined
+                        : depth.Format,
+                    samples: TryGetVulkanSampleCount(firstTarget.Samples, out var targetSamples)
+                        ? targetSamples
+                        : SampleCountFlags.Count1Bit);
                 resources.TransientRenderPass = transientRenderPass;
                 resources.TransientFramebuffer = transientFramebuffer;
                 transientRenderPass = default;
@@ -10714,27 +10964,34 @@ internal static unsafe class VulkanVideoPresenter
                     resources,
                     PipelineStageFlags.FragmentShaderBit);
                 RecordTextureUploads(resources, PipelineStageFlags.FragmentShaderBit);
+                RecordD16DepthStorageAliases(resources, PipelineStageFlags.FragmentShaderBit);
                 RecordStorageImagesForWrite(resources, PipelineStageFlags.FragmentShaderBit);
+
+                RecordStorageAliasCopies(targets);
 
                 var toColorAttachments = stackalloc ImageMemoryBarrier[targets.Length];
                 var anyPriorContents = false;
                 for (var index = 0; index < targets.Length; index++)
                 {
-                    var hasPriorContents =
-                        targets[index].Initialized || targets[index].InitialUploadPending;
+                    var isMsaa = targets[index].MsaaImage.Handle != 0;
+                    var hasPriorContents = isMsaa
+                        ? targets[index].MsaaInitialized
+                        : targets[index].Initialized || targets[index].InitialUploadPending;
                     anyPriorContents |= hasPriorContents;
                     toColorAttachments[index] = new ImageMemoryBarrier
                     {
                         SType = StructureType.ImageMemoryBarrier,
-                        SrcAccessMask = hasPriorContents ? AccessFlags.ShaderReadBit : 0,
+                        SrcAccessMask = isMsaa
+                            ? (hasPriorContents ? AccessFlags.ColorAttachmentWriteBit : 0)
+                            : (hasPriorContents ? AccessFlags.ShaderReadBit : 0),
                         DstAccessMask = AccessFlags.ColorAttachmentWriteBit,
-                        OldLayout = hasPriorContents
-                            ? ImageLayout.ShaderReadOnlyOptimal
-                            : ImageLayout.Undefined,
+                        OldLayout = isMsaa
+                            ? (hasPriorContents ? ImageLayout.ColorAttachmentOptimal : ImageLayout.Undefined)
+                            : (hasPriorContents ? ImageLayout.ShaderReadOnlyOptimal : ImageLayout.Undefined),
                         NewLayout = ImageLayout.ColorAttachmentOptimal,
                         SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                         DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                        Image = targets[index].Image,
+                        Image = isMsaa ? targets[index].MsaaImage : targets[index].Image,
                         SubresourceRange = ColorSubresourceRange(),
                     };
                 }
@@ -10791,6 +11048,7 @@ internal static unsafe class VulkanVideoPresenter
                     framebuffer,
                     extent,
                     colorAttachmentCount: targets.Length,
+                    resolveAttachmentCount: targets.Count(target => target.MsaaImage.Handle != 0),
                     hasDepthAttachment: depth is not null && !clearDepthSeparately,
                     clearDepth: depth?.ClearDepth ?? 1f);
                 RecordTranslatedDrawInPass(resources, extent);
@@ -10799,12 +11057,17 @@ internal static unsafe class VulkanVideoPresenter
                 var toShaderRead = stackalloc ImageMemoryBarrier[targets.Length];
                 for (var index = 0; index < targets.Length; index++)
                 {
+                    var isMsaa = targets[index].MsaaImage.Handle != 0;
                     toShaderRead[index] = new ImageMemoryBarrier
                     {
                         SType = StructureType.ImageMemoryBarrier,
                         SrcAccessMask = AccessFlags.ColorAttachmentWriteBit,
                         DstAccessMask = AccessFlags.ShaderReadBit,
-                        OldLayout = ImageLayout.ColorAttachmentOptimal,
+                        // A resolve attachment leaves the render pass in sampled
+                        // layout. Keep that layout while publishing write visibility.
+                        OldLayout = isMsaa
+                            ? ImageLayout.ShaderReadOnlyOptimal
+                            : ImageLayout.ColorAttachmentOptimal,
                         NewLayout = ImageLayout.ShaderReadOnlyOptimal,
                         SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                         DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
@@ -10842,6 +11105,10 @@ internal static unsafe class VulkanVideoPresenter
                 foreach (var target in targets)
                 {
                     target.Initialized = true;
+                    if (target.MsaaImage.Handle != 0)
+                    {
+                        target.MsaaInitialized = true;
+                    }
                     target.InitialUploadPending = false;
                 }
                 if (depth is not null)
@@ -10858,6 +11125,10 @@ internal static unsafe class VulkanVideoPresenter
                     else if (draw.RenderState.Depth.WriteEnable)
                     {
                         depth.InitializationSource = "translated-depth-write";
+                    }
+                    if (clearDepthForDraw || draw.RenderState.Depth.WriteEnable)
+                    {
+                        depth.ContentVersion++;
                     }
                 }
                 MarkSampledImagesInitialized(resources);
@@ -11334,8 +11605,8 @@ internal static unsafe class VulkanVideoPresenter
             Format format,
             bool requiresStorage = false)
         {
-            var supportsStorageUsage = SupportsStorageImage(format);
-            if (requiresStorage && !supportsStorageUsage)
+            var supportsStorageFormat = SupportsStorageImage(format);
+            if (requiresStorage && !supportsStorageFormat)
             {
                 throw new InvalidOperationException(
                     $"Storage image format {format} is unsupported for guest " +
@@ -11357,14 +11628,19 @@ internal static unsafe class VulkanVideoPresenter
                 target.Height,
                 mipLevels,
                 guestFormat,
-                format);
+                format,
+                requiresStorage,
+                requiresStorage ? 1u : target.Samples);
+            GuestImageResource? storageAliasSource = null;
             if (_guestImages.TryGetValue(target.Address, out var existing))
             {
                 if (existing.LogicalWidth == target.Width &&
                     existing.LogicalHeight == target.Height &&
                     existing.MipLevels == mipLevels &&
                     existing.GuestFormat == guestFormat &&
-                    existing.Format == format)
+                    existing.Format == format &&
+                    existing.StorageSized == requiresStorage &&
+                    existing.Samples == (requiresStorage ? 1u : target.Samples))
                 {
                     if (requiresStorage && !existing.SupportsStorageUsage)
                     {
@@ -11408,14 +11684,38 @@ internal static unsafe class VulkanVideoPresenter
                         $"initialized={existing.Initialized}");
                 }
 
+                if (!requiresStorage &&
+                    existing.StorageSized &&
+                    existing.Initialized &&
+                    existing.Format == format)
+                {
+                    if (existing.Width == physicalWidth &&
+                        existing.Height == physicalHeight &&
+                        existing.MipLevels == 1 &&
+                        mipLevels == 1)
+                    {
+                        storageAliasSource = existing;
+                    }
+                    else
+                    {
+                        // Image copies require equal extents.  Publish the old
+                        // GPU-owned storage bytes to their original tiled guest
+                        // backing before retiring it; normal RT initial-data
+                        // upload then consumes that backing at its new extent.
+                        PublishStorageAliasToGuest(existing);
+                    }
+                }
+
                 _guestImageVariants.Add(
                     new GuestImageVariantKey(
                         existing.Address,
                         existing.LogicalWidth,
                         existing.LogicalHeight,
                         existing.MipLevels,
-                    existing.GuestFormat,
-                    existing.Format),
+                        existing.GuestFormat,
+                        existing.Format,
+                        existing.StorageSized,
+                        existing.Samples),
                     existing);
                 _guestImages.Remove(target.Address);
                 lock (_gate)
@@ -11489,7 +11789,7 @@ internal static unsafe class VulkanVideoPresenter
                 Usage =
                     ImageUsageFlags.ColorAttachmentBit |
                     ImageUsageFlags.SampledBit |
-                    (supportsStorageUsage ? ImageUsageFlags.StorageBit : (ImageUsageFlags)0) |
+                    (requiresStorage ? ImageUsageFlags.StorageBit : (ImageUsageFlags)0) |
                     ImageUsageFlags.TransferSrcBit |
                     ImageUsageFlags.TransferDstBit,
                 SharingMode = SharingMode.Exclusive,
@@ -11548,6 +11848,27 @@ internal static unsafe class VulkanVideoPresenter
             RenderPass renderPass = default;
             RenderPass initialRenderPass = default;
             Framebuffer framebuffer = default;
+            var resourceSamples = requiresStorage ? 1u : target.Samples;
+            if (!TryGetVulkanSampleCount(resourceSamples, out var sampleCount))
+            {
+                throw new InvalidOperationException($"Unsupported PS5 render-target sample count {resourceSamples}.");
+            }
+            if (!requiresStorage && sampleCount != SampleCountFlags.Count1Bit && mipLevels != 1)
+            {
+                // Vulkan resolve attachments are single-mip images in the
+                // native PS5 MSAA path; mipmapped MSAA descriptors require a
+                // separate per-level resolve implementation.
+                throw new InvalidOperationException(
+                    "Multisampled PS5 render targets require a single mip level.");
+            }
+            Image msaaImage = default;
+            DeviceMemory msaaMemory = default;
+            ImageView msaaView = default;
+            if (!requiresStorage && sampleCount != SampleCountFlags.Count1Bit)
+            {
+                (msaaImage, msaaMemory, msaaView) = CreateMsaaColorAttachment(
+                    physicalWidth, physicalHeight, format, sampleCount);
+            }
             if (!requiresStorage)
             {
                 (renderPass, initialRenderPass, framebuffer) =
@@ -11555,7 +11876,9 @@ internal static unsafe class VulkanVideoPresenter
                         format,
                         mipViews[0],
                         physicalWidth,
-                        physicalHeight);
+                        physicalHeight,
+                        sampleCount,
+                        msaaView);
             }
 
             var resource = new GuestImageResource
@@ -11566,16 +11889,22 @@ internal static unsafe class VulkanVideoPresenter
                 LogicalWidth = target.Width,
                 LogicalHeight = target.Height,
                 MipLevels = mipLevels,
+                Samples = resourceSamples,
                 GuestFormat = guestFormat,
                 Format = format,
                 Image = image,
                 Memory = memory,
                 View = view,
                 MipViews = mipViews,
+                MsaaImage = msaaImage,
+                MsaaMemory = msaaMemory,
+                MsaaView = msaaView,
                 RenderPass = renderPass,
                 InitialRenderPass = initialRenderPass,
                 Framebuffer = framebuffer,
-                SupportsStorageUsage = supportsStorageUsage,
+                SupportsStorageUsage = requiresStorage,
+                StorageSized = requiresStorage,
+                StorageAliasSource = storageAliasSource,
             };
             var debugName = GuestImageDebugName(target, format);
             SetDebugName(ObjectType.Image, image.Handle, $"{debugName} image");
@@ -11626,14 +11955,82 @@ internal static unsafe class VulkanVideoPresenter
             Format format,
             ImageView attachmentView,
             uint width,
-            uint height)
+            uint height,
+            SampleCountFlags samples = SampleCountFlags.Count1Bit,
+            ImageView msaaView = default)
         {
+            if (samples != SampleCountFlags.Count1Bit)
+            {
+                return CreateMsaaRenderPassAndFramebuffer(format, attachmentView, msaaView, width, height, samples);
+            }
             var load = CreateRenderPassAndFramebuffer(
                 [format], [attachmentView], width, height, [true], null, false);
             var initial = CreateRenderPassAndFramebuffer(
                 [format], [attachmentView], width, height, [false], null, false);
             _vk.DestroyFramebuffer(_device, initial.Framebuffer, null);
             return (load.RenderPass, initial.RenderPass, load.Framebuffer);
+        }
+
+        private (RenderPass RenderPass, RenderPass InitialRenderPass, Framebuffer Framebuffer)
+            CreateMsaaRenderPassAndFramebuffer(
+            Format format, ImageView resolveView, ImageView msaaView, uint width, uint height,
+            SampleCountFlags samples)
+        {
+            if (msaaView.Handle == 0)
+            {
+                throw new InvalidOperationException("MSAA render pass requires a multisample attachment view.");
+            }
+            var loadRenderPass = CreateSingleMsaaRenderPass(format, samples, loadColor: true);
+            var initialRenderPass = CreateSingleMsaaRenderPass(format, samples, loadColor: false);
+            var views = stackalloc ImageView[2]; views[0] = msaaView; views[1] = resolveView;
+            var fb = new FramebufferCreateInfo
+            {
+                SType = StructureType.FramebufferCreateInfo, RenderPass = loadRenderPass, AttachmentCount = 2,
+                PAttachments = views, Width = width, Height = height, Layers = 1,
+            };
+            Check(_vk.CreateFramebuffer(_device, &fb, null, out var framebuffer), "vkCreateFramebuffer(msaa)");
+            return (loadRenderPass, initialRenderPass, framebuffer);
+        }
+
+        private RenderPass CreateSingleMsaaRenderPass(
+            Format format,
+            SampleCountFlags samples,
+            bool loadColor)
+        {
+            var attachments = stackalloc AttachmentDescription[2];
+            attachments[0] = new AttachmentDescription
+            {
+                Format = format, Samples = samples,
+                LoadOp = loadColor ? AttachmentLoadOp.Load : AttachmentLoadOp.Clear,
+                // Preserve native per-sample data between draws; the resolve
+                // image is a publication/sampling result, not its replacement.
+                StoreOp = AttachmentStoreOp.Store, StencilLoadOp = AttachmentLoadOp.DontCare,
+                StencilStoreOp = AttachmentStoreOp.DontCare,
+                InitialLayout = ImageLayout.ColorAttachmentOptimal,
+                FinalLayout = ImageLayout.ColorAttachmentOptimal,
+            };
+            attachments[1] = new AttachmentDescription
+            {
+                Format = format, Samples = SampleCountFlags.Count1Bit, LoadOp = AttachmentLoadOp.DontCare,
+                StoreOp = AttachmentStoreOp.Store, StencilLoadOp = AttachmentLoadOp.DontCare,
+                StencilStoreOp = AttachmentStoreOp.DontCare,
+                InitialLayout = ImageLayout.ShaderReadOnlyOptimal,
+                FinalLayout = ImageLayout.ShaderReadOnlyOptimal,
+            };
+            var colorReference = new AttachmentReference { Attachment = 0, Layout = ImageLayout.ColorAttachmentOptimal };
+            var resolveReference = new AttachmentReference { Attachment = 1, Layout = ImageLayout.ColorAttachmentOptimal };
+            var subpass = new SubpassDescription
+            {
+                PipelineBindPoint = PipelineBindPoint.Graphics, ColorAttachmentCount = 1,
+                PColorAttachments = &colorReference, PResolveAttachments = &resolveReference,
+            };
+            var info = new RenderPassCreateInfo
+            {
+                SType = StructureType.RenderPassCreateInfo, AttachmentCount = 2, PAttachments = attachments,
+                SubpassCount = 1, PSubpasses = &subpass,
+            };
+            Check(_vk.CreateRenderPass(_device, &info, null, out var renderPass), "vkCreateRenderPass(msaa)");
+            return renderPass;
         }
 
         private (RenderPass RenderPass, Framebuffer Framebuffer) CreateRenderPassAndFramebuffer(
@@ -11649,6 +12046,107 @@ internal static unsafe class VulkanVideoPresenter
                 Enumerable.Repeat(true, formats.Count).ToArray(),
                 null,
                 false);
+
+        // MRT resolves use one multisample color attachment and one persistent
+        // single-sample resolve attachment per guest RT.  Keep this separate
+        // from the 1x helper so the attachment ordering remains explicit.
+        private (RenderPass RenderPass, Framebuffer Framebuffer) CreateMsaaMrtRenderPassAndFramebuffer(
+            IReadOnlyList<GuestImageResource> targets,
+            IReadOnlyList<Format> formats,
+            uint width,
+            uint height,
+            GuestDepthResource? depth,
+            bool depthInitialized)
+        {
+            if (targets.Count == 0 || targets.Count != formats.Count ||
+                !TryGetVulkanSampleCount(targets[0].Samples, out var samples) ||
+                samples == SampleCountFlags.Count1Bit ||
+                targets.Any(target => target.MsaaView.Handle == 0 ||
+                    !TryGetVulkanSampleCount(target.Samples, out var current) || current != samples))
+            {
+                throw new InvalidOperationException("MSAA MRT requires matched multisample color attachments.");
+            }
+            if (depth is not null &&
+                (!TryGetVulkanSampleCount(depth.Samples, out var depthSamples) || depthSamples != samples))
+            {
+                throw new InvalidOperationException(
+                    $"Color/depth MSAA mismatch: color={targets[0].Samples} depth={depth.Samples}.");
+            }
+
+            var colorCount = targets.Count;
+            var depthIndex = colorCount * 2;
+            var attachmentCount = depthIndex + (depth is null ? 0 : 1);
+            var attachments = stackalloc AttachmentDescription[attachmentCount];
+            var colorReferences = stackalloc AttachmentReference[colorCount];
+            var resolveReferences = stackalloc AttachmentReference[colorCount];
+            var views = stackalloc ImageView[attachmentCount];
+            for (var index = 0; index < colorCount; index++)
+            {
+                attachments[index] = new AttachmentDescription
+                {
+                    Format = formats[index], Samples = samples,
+                    LoadOp = targets[index].MsaaInitialized
+                        ? AttachmentLoadOp.Load
+                        : AttachmentLoadOp.Clear,
+                    StoreOp = AttachmentStoreOp.Store, StencilLoadOp = AttachmentLoadOp.DontCare,
+                    StencilStoreOp = AttachmentStoreOp.DontCare,
+                    InitialLayout = ImageLayout.ColorAttachmentOptimal,
+                    FinalLayout = ImageLayout.ColorAttachmentOptimal,
+                };
+                attachments[colorCount + index] = new AttachmentDescription
+                {
+                    Format = formats[index], Samples = SampleCountFlags.Count1Bit,
+                    LoadOp = AttachmentLoadOp.DontCare, StoreOp = AttachmentStoreOp.Store,
+                    StencilLoadOp = AttachmentLoadOp.DontCare, StencilStoreOp = AttachmentStoreOp.DontCare,
+                    InitialLayout = ImageLayout.ShaderReadOnlyOptimal,
+                    FinalLayout = ImageLayout.ShaderReadOnlyOptimal,
+                };
+                colorReferences[index] = new AttachmentReference((uint)index, ImageLayout.ColorAttachmentOptimal);
+                resolveReferences[index] = new AttachmentReference((uint)(colorCount + index), ImageLayout.ColorAttachmentOptimal);
+                views[index] = targets[index].MsaaView;
+                views[colorCount + index] = targets[index].MipViews.Length > 0
+                    ? targets[index].MipViews[0] : targets[index].View;
+            }
+
+            AttachmentReference depthReference = default;
+            if (depth is not null)
+            {
+                attachments[depthIndex] = new AttachmentDescription
+                {
+                    Format = depth.Format, Samples = samples,
+                    LoadOp = depthInitialized ? AttachmentLoadOp.Load : AttachmentLoadOp.Clear,
+                    StoreOp = AttachmentStoreOp.Store, StencilLoadOp = AttachmentLoadOp.DontCare,
+                    StencilStoreOp = AttachmentStoreOp.DontCare,
+                    InitialLayout = depthInitialized ? ImageLayout.DepthStencilAttachmentOptimal : ImageLayout.Undefined,
+                    FinalLayout = ImageLayout.DepthStencilAttachmentOptimal,
+                };
+                depthReference = new AttachmentReference((uint)depthIndex, ImageLayout.DepthStencilAttachmentOptimal);
+                views[depthIndex] = depth.View;
+            }
+
+            var subpass = new SubpassDescription
+            {
+                PipelineBindPoint = PipelineBindPoint.Graphics,
+                ColorAttachmentCount = (uint)colorCount,
+                PColorAttachments = colorReferences,
+                PResolveAttachments = resolveReferences,
+                PDepthStencilAttachment = depth is null ? null : &depthReference,
+            };
+            var createInfo = new RenderPassCreateInfo
+            {
+                SType = StructureType.RenderPassCreateInfo, AttachmentCount = (uint)attachmentCount,
+                PAttachments = attachments, SubpassCount = 1, PSubpasses = &subpass,
+            };
+            Check(_vk.CreateRenderPass(_device, &createInfo, null, out var renderPass), "vkCreateRenderPass(msaa mrt)");
+            var framebufferInfo = new FramebufferCreateInfo
+            {
+                SType = StructureType.FramebufferCreateInfo, RenderPass = renderPass,
+                AttachmentCount = (uint)attachmentCount, PAttachments = views,
+                Width = width, Height = height, Layers = 1,
+            };
+            Check(_vk.CreateFramebuffer(_device, &framebufferInfo, null, out var framebuffer), "vkCreateFramebuffer(msaa mrt)");
+            return (renderPass, framebuffer);
+        }
 
         private (RenderPass RenderPass, Framebuffer Framebuffer) CreateRenderPassAndFramebuffer(
             IReadOnlyList<Format> formats,
@@ -11699,7 +12197,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 attachments[formats.Count] = new AttachmentDescription
                 {
-                    Format = DepthFormat,
+                    Format = depth.Format,
                     Samples = SampleCountFlags.Count1Bit,
                     LoadOp = depthInitialized
                         ? AttachmentLoadOp.Load
@@ -11758,17 +12256,24 @@ internal static unsafe class VulkanVideoPresenter
 
         private (Image Image, DeviceMemory Memory, ImageView View) CreateDepthAttachment(
             uint width,
-            uint height)
+            uint height,
+            Format format,
+            SampleCountFlags samples)
         {
+            if ((_framebufferDepthSampleCounts & samples) != samples)
+            {
+                throw new InvalidOperationException(
+                    $"Vulkan depth attachments do not support sample count {samples}.");
+            }
             var imageInfo = new ImageCreateInfo
             {
                 SType = StructureType.ImageCreateInfo,
                 ImageType = ImageType.Type2D,
-                Format = DepthFormat,
+                Format = format,
                 Extent = new Extent3D(Math.Max(width, 1), Math.Max(height, 1), 1),
                 MipLevels = 1,
                 ArrayLayers = 1,
-                Samples = SampleCountFlags.Count1Bit,
+                Samples = samples,
                 Tiling = ImageTiling.Optimal,
                 Usage =
                     ImageUsageFlags.DepthStencilAttachmentBit |
@@ -11794,22 +12299,76 @@ internal static unsafe class VulkanVideoPresenter
                 SType = StructureType.ImageViewCreateInfo,
                 Image = image,
                 ViewType = ImageViewType.Type2D,
-                Format = DepthFormat,
+                Format = format,
                 SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.DepthBit, 0, 1, 0, 1),
             };
             Check(_vk.CreateImageView(_device, &viewInfo, null, out var view), "vkCreateImageView(depth)");
             return (image, memory, view);
         }
 
+        private (Image Image, DeviceMemory Memory, ImageView View) CreateMsaaColorAttachment(
+            uint width,
+            uint height,
+            Format format,
+            SampleCountFlags samples)
+        {
+            if ((_framebufferColorSampleCounts & samples) != samples)
+            {
+                throw new InvalidOperationException(
+                    $"Vulkan color attachments do not support sample count {samples}.");
+            }
+            var imageInfo = new ImageCreateInfo
+            {
+                SType = StructureType.ImageCreateInfo,
+                Flags = ImageCreateFlags.CreateMutableFormatBit | ImageCreateFlags.CreateExtendedUsageBit,
+                ImageType = ImageType.Type2D,
+                Format = format,
+                Extent = new Extent3D(width, height, 1),
+                MipLevels = 1,
+                ArrayLayers = 1,
+                Samples = samples,
+                Tiling = ImageTiling.Optimal,
+                Usage = ImageUsageFlags.ColorAttachmentBit | ImageUsageFlags.TransferSrcBit,
+                SharingMode = SharingMode.Exclusive,
+                InitialLayout = ImageLayout.Undefined,
+            };
+            Check(_vk.CreateImage(_device, &imageInfo, null, out var image), "vkCreateImage(msaa color)");
+            _vk.GetImageMemoryRequirements(_device, image, out var requirements);
+            var allocation = new MemoryAllocateInfo
+            {
+                SType = StructureType.MemoryAllocateInfo,
+                AllocationSize = requirements.Size,
+                MemoryTypeIndex = FindMemoryType(requirements.MemoryTypeBits, MemoryPropertyFlags.DeviceLocalBit),
+            };
+            Check(_vk.AllocateMemory(_device, &allocation, null, out var memory), "vkAllocateMemory(msaa color)");
+            Check(_vk.BindImageMemory(_device, image, memory, 0), "vkBindImageMemory(msaa color)");
+            var viewInfo = new ImageViewCreateInfo
+            {
+                SType = StructureType.ImageViewCreateInfo,
+                Image = image,
+                ViewType = ImageViewType.Type2D,
+                Format = format,
+                Components = new ComponentMapping(ComponentSwizzle.Identity, ComponentSwizzle.Identity,
+                    ComponentSwizzle.Identity, ComponentSwizzle.Identity),
+                SubresourceRange = ColorSubresourceRange(),
+            };
+            Check(_vk.CreateImageView(_device, &viewInfo, null, out var view), "vkCreateImageView(msaa color)");
+            return (image, memory, view);
+        }
+
         private GuestDepthResource GetOrCreateGuestDepth(GuestDepthTarget target)
         {
+            RetireStencilStorageAliases(target);
             var key = new GuestDepthKey(
                 target.Address,
                 target.ReadAddress,
+                target.StencilAddress,
+                target.StencilSize,
                 target.Width,
                 target.Height,
                 target.GuestFormat,
-                target.SwizzleMode);
+                target.SwizzleMode,
+                target.Samples);
             if (_guestDepthImages.TryGetValue(key, out var existing))
             {
                 existing.GuestClearDepth = target.ClearDepth;
@@ -11822,7 +12381,12 @@ internal static unsafe class VulkanVideoPresenter
 
             var physicalWidth = ScaleGuestDimension(target.Width);
             var physicalHeight = ScaleGuestDimension(target.Height);
-            var (image, memory, view) = CreateDepthAttachment(physicalWidth, physicalHeight);
+            var format = GetDepthFormat(target.GuestFormat);
+            if (!TryGetVulkanSampleCount(target.Samples, out var samples))
+            {
+                throw new InvalidOperationException($"Unsupported PS5 depth sample count {target.Samples}.");
+            }
+            var (image, memory, view) = CreateDepthAttachment(physicalWidth, physicalHeight, format, samples);
             var resource = new GuestDepthResource
             {
                 Key = key,
@@ -11834,7 +12398,9 @@ internal static unsafe class VulkanVideoPresenter
                 LogicalWidth = target.Width,
                 LogicalHeight = target.Height,
                 GuestFormat = target.GuestFormat,
+                Format = format,
                 SwizzleMode = target.SwizzleMode,
+                Samples = target.Samples,
                 Image = image,
                 Memory = memory,
                 View = view,
@@ -11918,10 +12484,13 @@ internal static unsafe class VulkanVideoPresenter
             var key = new GuestDepthKey(
                 depth.Address,
                 depth.ReadAddress,
+                depth.StencilAddress,
+                depth.StencilSize,
                 depth.Width,
                 depth.Height,
                 depth.GuestFormat,
-                depth.SwizzleMode);
+                depth.SwizzleMode,
+                depth.Samples);
             if (!_depthOnlyColorAddresses.TryGetValue(key, out var address))
             {
                 address = _nextDepthOnlyColorAddress;
@@ -11938,7 +12507,8 @@ internal static unsafe class VulkanVideoPresenter
                 depth.Width,
                 depth.Height,
                 Format: 10,
-                NumberType: 0);
+                NumberType: 0,
+                Samples: depth.Samples);
         }
 
         private DepthFramebufferResource GetOrCreateDepthFramebuffer(
@@ -11951,30 +12521,54 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             var attachmentView = color.MipViews.Length > 0 ? color.MipViews[0] : color.View;
+            if (!TryGetVulkanSampleCount(color.Samples, out var colorSamples) ||
+                !TryGetVulkanSampleCount(depth.Samples, out var depthSamples) ||
+                colorSamples != depthSamples)
+            {
+                throw new InvalidOperationException(
+                    $"Color/depth MSAA mismatch: color={color.Samples} depth={depth.Samples}.");
+            }
             var loadRenderPass = CreateDepthRenderPass(
                 color.Format,
+                depth.Format,
                 clearColor: false,
-                clearDepth: false);
+                clearDepth: false,
+                samples: colorSamples);
             var colorClearRenderPass = CreateDepthRenderPass(
                 color.Format,
+                depth.Format,
                 clearColor: true,
-                clearDepth: false);
+                clearDepth: false,
+                samples: colorSamples);
             var depthClearRenderPass = CreateDepthRenderPass(
                 color.Format,
+                depth.Format,
                 clearColor: false,
-                clearDepth: true);
+                clearDepth: true,
+                samples: colorSamples);
             var bothClearRenderPass = CreateDepthRenderPass(
                 color.Format,
+                depth.Format,
                 clearColor: true,
-                clearDepth: true);
-            var attachments = stackalloc ImageView[2];
-            attachments[0] = attachmentView;
-            attachments[1] = depth.View;
+                clearDepth: true,
+                samples: colorSamples);
+            var msaa = color.MsaaView.Handle != 0;
+            var attachments = stackalloc ImageView[msaa ? 3 : 2];
+            attachments[0] = msaa ? color.MsaaView : attachmentView;
+            if (msaa)
+            {
+                attachments[1] = attachmentView;
+                attachments[2] = depth.View;
+            }
+            else
+            {
+                attachments[1] = depth.View;
+            }
             var framebufferInfo = new FramebufferCreateInfo
             {
                 SType = StructureType.FramebufferCreateInfo,
                 RenderPass = loadRenderPass,
-                AttachmentCount = 2,
+                AttachmentCount = msaa ? 3u : 2u,
                 PAttachments = attachments,
                 Width = Math.Min(color.Width, depth.Width),
                 Height = Math.Min(color.Height, depth.Height),
@@ -12004,14 +12598,19 @@ internal static unsafe class VulkanVideoPresenter
 
         private RenderPass CreateDepthRenderPass(
             Format colorFormat,
+            Format depthFormat,
             bool clearColor,
-            bool clearDepth)
+            bool clearDepth,
+            SampleCountFlags samples)
         {
-            var attachments = stackalloc AttachmentDescription[2];
+            var msaa = samples != SampleCountFlags.Count1Bit;
+            var attachments = stackalloc AttachmentDescription[msaa ? 3 : 2];
             attachments[0] = new AttachmentDescription
             {
                 Format = colorFormat,
-                Samples = SampleCountFlags.Count1Bit,
+                Samples = samples,
+                // Keep native samples after resolving: later depth/color draws
+                // can load their per-sample contents and resolve the update.
                 LoadOp = clearColor ? AttachmentLoadOp.Clear : AttachmentLoadOp.Load,
                 StoreOp = AttachmentStoreOp.Store,
                 StencilLoadOp = AttachmentLoadOp.DontCare,
@@ -12019,10 +12618,22 @@ internal static unsafe class VulkanVideoPresenter
                 InitialLayout = ImageLayout.ColorAttachmentOptimal,
                 FinalLayout = ImageLayout.ColorAttachmentOptimal,
             };
-            attachments[1] = new AttachmentDescription
+            var depthAttachment = msaa ? 2 : 1;
+            if (msaa)
             {
-                Format = DepthFormat,
-                Samples = SampleCountFlags.Count1Bit,
+                attachments[1] = new AttachmentDescription
+                {
+                    Format = colorFormat, Samples = SampleCountFlags.Count1Bit,
+                    LoadOp = AttachmentLoadOp.DontCare, StoreOp = AttachmentStoreOp.Store,
+                    StencilLoadOp = AttachmentLoadOp.DontCare, StencilStoreOp = AttachmentStoreOp.DontCare,
+                    InitialLayout = ImageLayout.ShaderReadOnlyOptimal,
+                    FinalLayout = ImageLayout.ShaderReadOnlyOptimal,
+                };
+            }
+            attachments[depthAttachment] = new AttachmentDescription
+            {
+                Format = depthFormat,
+                Samples = samples,
                 LoadOp = clearDepth ? AttachmentLoadOp.Clear : AttachmentLoadOp.Load,
                 StoreOp = AttachmentStoreOp.Store,
                 StencilLoadOp = AttachmentLoadOp.DontCare,
@@ -12039,14 +12650,20 @@ internal static unsafe class VulkanVideoPresenter
             };
             var depthReference = new AttachmentReference
             {
-                Attachment = 1,
+                Attachment = (uint)depthAttachment,
                 Layout = ImageLayout.DepthStencilAttachmentOptimal,
+            };
+            var resolveReference = new AttachmentReference
+            {
+                Attachment = msaa ? 1u : uint.MaxValue,
+                Layout = ImageLayout.ColorAttachmentOptimal,
             };
             var subpass = new SubpassDescription
             {
                 PipelineBindPoint = PipelineBindPoint.Graphics,
                 ColorAttachmentCount = 1,
                 PColorAttachments = &colorReference,
+                PResolveAttachments = msaa ? &resolveReference : null,
                 PDepthStencilAttachment = &depthReference,
             };
             var dependency = new SubpassDependency
@@ -12066,7 +12683,7 @@ internal static unsafe class VulkanVideoPresenter
             var createInfo = new RenderPassCreateInfo
             {
                 SType = StructureType.RenderPassCreateInfo,
-                AttachmentCount = 2,
+                AttachmentCount = msaa ? 3u : 2u,
                 PAttachments = attachments,
                 SubpassCount = 1,
                 PSubpasses = &subpass,
@@ -12119,9 +12736,23 @@ internal static unsafe class VulkanVideoPresenter
                 _vk.DestroyRenderPass(_device, resource.RenderPass, null);
             }
 
-            if (resource.InitialRenderPass.Handle != 0)
+            if (resource.InitialRenderPass.Handle != 0 &&
+                resource.InitialRenderPass.Handle != resource.RenderPass.Handle)
             {
                 _vk.DestroyRenderPass(_device, resource.InitialRenderPass, null);
+            }
+
+            if (resource.MsaaView.Handle != 0)
+            {
+                _vk.DestroyImageView(_device, resource.MsaaView, null);
+            }
+            if (resource.MsaaImage.Handle != 0)
+            {
+                _vk.DestroyImage(_device, resource.MsaaImage, null);
+            }
+            if (resource.MsaaMemory.Handle != 0)
+            {
+                _vk.FreeMemory(_device, resource.MsaaMemory, null);
             }
 
             if (resource.View.Handle != 0)
@@ -12293,13 +12924,15 @@ internal static unsafe class VulkanVideoPresenter
             GuestImageResource resource,
             Format format,
             uint mipLevel,
-            uint levelCount) =>
+            uint levelCount,
+            bool arrayedView = false) =>
             GetOrCreateGuestImageView(
                 resource,
                 format,
                 mipLevel,
                 levelCount,
-                dstSelect: 0xFAC);
+                dstSelect: 0xFAC,
+                arrayedView: arrayedView);
 
         internal static bool IsCompatibleViewFormat(Format imageFormat, Format viewFormat)
         {
@@ -12560,7 +13193,7 @@ internal static unsafe class VulkanVideoPresenter
                 }
                 finally
                 {
-                    if (!deferGuestWork || !RequeueGuestWorkFront(pendingGuestWork))
+                    if (!deferGuestWork || !RequeueGuestWorkBack(pendingGuestWork))
                     {
                         CompleteGuestWork(pendingGuestWork);
                     }
@@ -13339,6 +13972,7 @@ internal static unsafe class VulkanVideoPresenter
                 PipelineStageFlags.VertexShaderBit |
                 PipelineStageFlags.FragmentShaderBit);
             RecordTextureUploads(resources, PipelineStageFlags.FragmentShaderBit);
+            RecordD16DepthStorageAliases(resources, PipelineStageFlags.FragmentShaderBit);
             RecordStorageImagesForWrite(resources, PipelineStageFlags.FragmentShaderBit);
             RecordTranslatedGraphicsPass(
                 resources,
@@ -13489,6 +14123,7 @@ internal static unsafe class VulkanVideoPresenter
                     1,
                     &depthRange);
                 depth.Initialized = true;
+                depth.ContentVersion++;
                 if (depth.InitializationSource == "none")
                 {
                     depth.InitializationSource = "sample-clear";
@@ -13600,6 +14235,7 @@ internal static unsafe class VulkanVideoPresenter
                 1,
                 &depthRange);
             depth.Initialized = true;
+            depth.ContentVersion++;
             depth.Layout = ImageLayout.TransferDstOptimal;
             depth.InitializationSource = "guest-depth-clear";
         }
@@ -13924,6 +14560,448 @@ internal static unsafe class VulkanVideoPresenter
                     null,
                     1,
                     &destinationToShader);
+            }
+        }
+
+        private void RecordStorageAliasCopies(IReadOnlyList<GuestImageResource> targets)
+        {
+            var toTransfer = stackalloc ImageMemoryBarrier[2];
+            var toShader = stackalloc ImageMemoryBarrier[2];
+            foreach (var target in targets)
+            {
+                if (target.StorageAliasSource is not { } source)
+                {
+                    continue;
+                }
+
+                target.StorageAliasSource = null;
+                if (!source.Initialized ||
+                    source.Width != target.Width ||
+                    source.Height != target.Height ||
+                    source.Format != target.Format)
+                {
+                    continue;
+                }
+
+                var sourceToTransfer = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = AccessFlags.ShaderReadBit,
+                    DstAccessMask = AccessFlags.TransferReadBit,
+                    OldLayout = ImageLayout.ShaderReadOnlyOptimal,
+                    NewLayout = ImageLayout.TransferSrcOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = source.Image,
+                    SubresourceRange = ColorSubresourceRange(),
+                };
+                var targetToTransfer = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    DstAccessMask = AccessFlags.TransferWriteBit,
+                    OldLayout = ImageLayout.Undefined,
+                    NewLayout = ImageLayout.TransferDstOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = target.Image,
+                    SubresourceRange = ColorSubresourceRange(),
+                };
+                toTransfer[0] = sourceToTransfer;
+                toTransfer[1] = targetToTransfer;
+                _vk.CmdPipelineBarrier(
+                    _commandBuffer,
+                    PipelineStageFlags.FragmentShaderBit | PipelineStageFlags.ComputeShaderBit,
+                    PipelineStageFlags.TransferBit,
+                    0,
+                    0,
+                    null,
+                    0,
+                    null,
+                    2,
+                    toTransfer);
+                var copy = new ImageCopy
+                {
+                    SrcSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
+                    DstSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
+                    Extent = new Extent3D(source.Width, source.Height, 1),
+                };
+                _vk.CmdCopyImage(
+                    _commandBuffer,
+                    source.Image,
+                    ImageLayout.TransferSrcOptimal,
+                    target.Image,
+                    ImageLayout.TransferDstOptimal,
+                    1,
+                    &copy);
+                var sourceToShader = sourceToTransfer with
+                {
+                    SrcAccessMask = AccessFlags.TransferReadBit,
+                    DstAccessMask = AccessFlags.ShaderReadBit,
+                    OldLayout = ImageLayout.TransferSrcOptimal,
+                    NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                };
+                var targetToShader = targetToTransfer with
+                {
+                    SrcAccessMask = AccessFlags.TransferWriteBit,
+                    DstAccessMask = AccessFlags.ShaderReadBit,
+                    OldLayout = ImageLayout.TransferDstOptimal,
+                    NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                };
+                toShader[0] = sourceToShader;
+                toShader[1] = targetToShader;
+                _vk.CmdPipelineBarrier(
+                    _commandBuffer,
+                    PipelineStageFlags.TransferBit,
+                    PipelineStageFlags.FragmentShaderBit,
+                    0,
+                    0,
+                    null,
+                    0,
+                    null,
+                    2,
+                    toShader);
+                target.Initialized = true;
+            }
+        }
+
+        // DB stencil lives in a separately allocated byte plane. A depth-tiled
+        // R8 storage descriptor may cover the whole plane or only a subrange;
+        // in either case it must publish only its own bytes and retire before
+        // the typed DB attachment becomes owner.  Do not compare it with the
+        // depth address: those planes intentionally do not overlap.
+        private void RetireStencilStorageAliases(GuestDepthTarget target)
+        {
+            var stencilAddress = target.StencilAddress;
+            var stencilSize = target.StencilSize;
+            if (!target.StencilAccess || stencilAddress == 0 || stencilSize == 0 ||
+                stencilAddress > ulong.MaxValue - stencilSize)
+            {
+                return;
+            }
+
+            var stencilEnd = stencilAddress + stencilSize;
+            var depthAddress = target.Address;
+            var depthBytes = (ulong)target.Width * target.Height * GetTextureBytesPerPixel(target.GuestFormat == 1 ? 2u : 4u);
+            var retire = new List<GuestImageResource>();
+            foreach (var candidate in _guestImages.Values)
+            {
+                if (!candidate.StorageSized || candidate.Address == 0 || candidate.GuestBackingSize == 0 ||
+                    candidate.Address > ulong.MaxValue - candidate.GuestBackingSize)
+                {
+                    continue;
+                }
+
+                var candidateEnd = candidate.Address + candidate.GuestBackingSize;
+                var overlapsStencil = candidate.Address < stencilEnd && stencilAddress < candidateEnd;
+                var overlapsDepth = depthAddress != 0 && depthBytes != 0 &&
+                    candidate.Address < depthAddress + depthBytes && depthAddress < candidateEnd;
+                if (overlapsStencil && !overlapsDepth)
+                {
+                    retire.Add(candidate);
+                }
+            }
+
+            foreach (var candidate in retire)
+            {
+                if (candidate.Initialized)
+                {
+                    PublishStorageAliasToGuest(candidate);
+                }
+
+                if (_guestImages.TryGetValue(candidate.Address, out var current) &&
+                    ReferenceEquals(current, candidate))
+                {
+                    _guestImages.Remove(candidate.Address);
+                }
+                _guestImageVariants.Remove(new GuestImageVariantKey(
+                    candidate.Address, candidate.LogicalWidth, candidate.LogicalHeight,
+                    candidate.MipLevels, candidate.GuestFormat, candidate.Format, candidate.StorageSized,
+                    candidate.Samples));
+            }
+        }
+
+        /// <summary>
+        /// Makes a storage image's writes visible to guest memory before a
+        /// differently sized render-target descriptor replaces it.  Vulkan
+        /// image copies cannot express that alias, so this deliberately uses a
+        /// completed fence/queue boundary: GPU image -> linear host buffer ->
+        /// original tiled guest backing.  The caller is before creation of the
+        /// replacement target, therefore its normal initial upload observes
+        /// exactly these published bytes.
+        /// </summary>
+        private void PublishStorageAliasToGuest(GuestImageResource image)
+        {
+            var guestMemory = _guestMemory;
+            var bytesPerElement = image.GuestBytesPerElement;
+            var pitch = Math.Max(image.GuestPitch, image.LogicalWidth);
+            if (guestMemory is null || image.Address == 0 || bytesPerElement == 0 ||
+                image.LogicalWidth == 0 || image.LogicalHeight == 0 ||
+                image.Width != image.LogicalWidth || image.Height != image.LogicalHeight)
+            {
+                return;
+            }
+
+            var linearByteCount = checked((ulong)image.Width * image.Height * bytesPerElement);
+            var backingSize = image.GuestBackingSize;
+            if (linearByteCount == 0 || linearByteCount > int.MaxValue ||
+                backingSize == 0 || backingSize > int.MaxValue)
+            {
+                return;
+            }
+
+            // The active recording buffer may contain the storage write. Submit
+            // it first and wait for its fence; mapping before that would publish
+            // stale bytes and corrupt the next RT upload.
+            WaitForAllGuestSubmissionsForCpuVisibility();
+
+            var buffer = CreateBuffer(
+                linearByteCount,
+                BufferUsageFlags.TransferDstBit,
+                MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+                out var memory);
+            var commandBuffer = AllocateGuestCommandBuffer();
+            var fence = AcquireGuestFence();
+            try
+            {
+                var beginInfo = new CommandBufferBeginInfo
+                {
+                    SType = StructureType.CommandBufferBeginInfo,
+                    Flags = CommandBufferUsageFlags.OneTimeSubmitBit,
+                };
+                Check(_vk.BeginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer(storage alias readback)");
+                var toTransfer = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = AccessFlags.ShaderReadBit,
+                    DstAccessMask = AccessFlags.TransferReadBit,
+                    OldLayout = ImageLayout.ShaderReadOnlyOptimal,
+                    NewLayout = ImageLayout.TransferSrcOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = image.Image,
+                    SubresourceRange = ColorSubresourceRange(),
+                };
+                _vk.CmdPipelineBarrier(commandBuffer,
+                    PipelineStageFlags.FragmentShaderBit | PipelineStageFlags.ComputeShaderBit,
+                    PipelineStageFlags.TransferBit, 0, 0, null, 0, null, 1, &toTransfer);
+                var copy = new BufferImageCopy
+                {
+                    ImageSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
+                    ImageExtent = new Extent3D(image.Width, image.Height, 1),
+                };
+                _vk.CmdCopyImageToBuffer(commandBuffer, image.Image, ImageLayout.TransferSrcOptimal, buffer, 1, &copy);
+                var toSampled = toTransfer with
+                {
+                    SrcAccessMask = AccessFlags.TransferReadBit,
+                    DstAccessMask = AccessFlags.ShaderReadBit,
+                    OldLayout = ImageLayout.TransferSrcOptimal,
+                    NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                };
+                _vk.CmdPipelineBarrier(commandBuffer, PipelineStageFlags.TransferBit,
+                    PipelineStageFlags.FragmentShaderBit | PipelineStageFlags.ComputeShaderBit,
+                    0, 0, null, 0, null, 1, &toSampled);
+                Check(_vk.EndCommandBuffer(commandBuffer), "vkEndCommandBuffer(storage alias readback)");
+                var submit = new SubmitInfo
+                {
+                    SType = StructureType.SubmitInfo,
+                    CommandBufferCount = 1,
+                    PCommandBuffers = &commandBuffer,
+                };
+                Check(_vk.QueueSubmit(_queue, 1, &submit, fence), "vkQueueSubmit(storage alias readback)");
+                Check(_vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue),
+                    "vkWaitForFences(storage alias readback)");
+
+                void* mapped;
+                Check(_vk.MapMemory(_device, memory, 0, linearByteCount, 0, &mapped), "vkMapMemory(storage alias readback)");
+                try
+                {
+                    var compact = new ReadOnlySpan<byte>(mapped, checked((int)linearByteCount));
+                    var linear = new byte[checked((int)((ulong)pitch * image.Height * bytesPerElement))];
+                    for (var row = 0u; row < image.Height; row++)
+                    {
+                        compact.Slice(checked((int)((ulong)row * image.Width * bytesPerElement)),
+                                      checked((int)(image.Width * bytesPerElement)))
+                            .CopyTo(linear.AsSpan(checked((int)((ulong)row * pitch * bytesPerElement))));
+                    }
+                    // A storage descriptor may cover only a prefix of the
+                    // backing that is subsequently reused by a larger render
+                    // target. Preserve the CPU-current bytes outside the
+                    // storage footprint before publishing the GPU-owned range.
+                    var backing = new byte[checked((int)backingSize)];
+                    if (!guestMemory.TryRead(image.Address, backing))
+                    {
+                        return;
+                    }
+                    var tiled = image.GuestTileMode != 0 && GnmTiling.TryTile(
+                        linear, backing, image.GuestTileMode, checked((int)pitch),
+                        checked((int)image.Height), checked((int)bytesPerElement));
+                    if (!tiled)
+                    {
+                        linear.AsSpan(0, Math.Min(linear.Length, backing.Length)).CopyTo(backing);
+                    }
+
+                    _ = guestMemory.TryWrite(image.Address, backing);
+                }
+                finally
+                {
+                    _vk.UnmapMemory(_device, memory);
+                }
+            }
+            finally
+            {
+                ReleaseGuestCommandBuffer(commandBuffer);
+                ReleaseGuestFence(fence, needsReset: true);
+                _vk.DestroyBuffer(_device, buffer, null);
+                _vk.FreeMemory(_device, memory, null);
+            }
+        }
+
+        private void RecordD16DepthStorageAliases(
+            TranslatedDrawResources resources,
+            PipelineStageFlags shaderStage)
+        {
+            var toTransfer = stackalloc ImageMemoryBarrier[2];
+            var toShader = stackalloc ImageMemoryBarrier[2];
+            foreach (var texture in resources.Textures)
+            {
+                if (texture.DepthStorageSource is not { } source ||
+                    texture.GuestImage is not { } destination ||
+                    destination.DepthAliasSourceVersion == source.ContentVersion)
+                {
+                    continue;
+                }
+
+                // Ensure an uninitialized DB surface has its guest clear before
+                // transferring it to the R16 storage representation.
+                RecordGuestDepthForSampling(source, shaderStage);
+                var depthRange = new ImageSubresourceRange(ImageAspectFlags.DepthBit, 0, 1, 0, 1);
+                var colorRange = ColorSubresourceRange();
+                var sourceToTransfer = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = AccessFlags.ShaderReadBit,
+                    DstAccessMask = AccessFlags.TransferReadBit,
+                    OldLayout = ImageLayout.ShaderReadOnlyOptimal,
+                    NewLayout = ImageLayout.TransferSrcOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = source.Image,
+                    SubresourceRange = depthRange,
+                };
+                var destinationToTransfer = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    DstAccessMask = AccessFlags.TransferWriteBit,
+                    OldLayout = destination.Initialized
+                        ? ImageLayout.ShaderReadOnlyOptimal
+                        : ImageLayout.Undefined,
+                    NewLayout = ImageLayout.TransferDstOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = destination.Image,
+                    SubresourceRange = colorRange,
+                };
+                toTransfer[0] = sourceToTransfer;
+                toTransfer[1] = destinationToTransfer;
+                _vk.CmdPipelineBarrier(
+                    _commandBuffer,
+                    shaderStage,
+                    PipelineStageFlags.TransferBit,
+                    0,
+                    0,
+                    null,
+                    0,
+                    null,
+                    2,
+                    toTransfer);
+
+                // D16_UNORM and R16_UNORM are not required to be image-copy
+                // compatible. Transfer their raw 16-bit depth elements through
+                // a buffer so this alias works on every conformant driver.
+                var byteCount = checked((ulong)source.Width * source.Height * sizeof(ushort));
+                var transferBuffer = CreateBuffer(
+                    byteCount,
+                    BufferUsageFlags.TransferSrcBit | BufferUsageFlags.TransferDstBit,
+                    MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+                    out var transferMemory);
+                resources.AliasTransferBuffers.Add((transferBuffer, transferMemory));
+                var sourceCopy = new BufferImageCopy
+                {
+                    ImageSubresource = new ImageSubresourceLayers(ImageAspectFlags.DepthBit, 0, 0, 1),
+                    ImageExtent = new Extent3D(source.Width, source.Height, 1),
+                };
+                _vk.CmdCopyImageToBuffer(
+                    _commandBuffer,
+                    source.Image,
+                    ImageLayout.TransferSrcOptimal,
+                    transferBuffer,
+                    1,
+                    &sourceCopy);
+                var bufferBarrier = new BufferMemoryBarrier
+                {
+                    SType = StructureType.BufferMemoryBarrier,
+                    SrcAccessMask = AccessFlags.TransferWriteBit,
+                    DstAccessMask = AccessFlags.TransferReadBit,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Buffer = transferBuffer,
+                    Offset = 0,
+                    Size = byteCount,
+                };
+                _vk.CmdPipelineBarrier(
+                    _commandBuffer,
+                    PipelineStageFlags.TransferBit,
+                    PipelineStageFlags.TransferBit,
+                    0,
+                    0,
+                    null,
+                    1,
+                    &bufferBarrier,
+                    0,
+                    null);
+                var destinationCopy = new BufferImageCopy
+                {
+                    ImageSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
+                    ImageExtent = new Extent3D(destination.Width, destination.Height, 1),
+                };
+                _vk.CmdCopyBufferToImage(
+                    _commandBuffer,
+                    transferBuffer,
+                    destination.Image,
+                    ImageLayout.TransferDstOptimal,
+                    1,
+                    &destinationCopy);
+
+                var sourceToShader = sourceToTransfer with
+                {
+                    SrcAccessMask = AccessFlags.TransferReadBit,
+                    DstAccessMask = AccessFlags.ShaderReadBit,
+                    OldLayout = ImageLayout.TransferSrcOptimal,
+                    NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                };
+                var destinationToShader = destinationToTransfer with
+                {
+                    SrcAccessMask = AccessFlags.TransferWriteBit,
+                    DstAccessMask = AccessFlags.ShaderReadBit,
+                    OldLayout = ImageLayout.TransferDstOptimal,
+                    NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                };
+                toShader[0] = sourceToShader;
+                toShader[1] = destinationToShader;
+                _vk.CmdPipelineBarrier(
+                    _commandBuffer,
+                    PipelineStageFlags.TransferBit,
+                    shaderStage,
+                    0,
+                    0,
+                    null,
+                    0,
+                    null,
+                    2,
+                    toShader);
+                source.Layout = ImageLayout.ShaderReadOnlyOptimal;
+                destination.Initialized = true;
+                destination.DepthAliasSourceVersion = source.ContentVersion;
             }
         }
 
@@ -14489,11 +15567,17 @@ internal static unsafe class VulkanVideoPresenter
             Framebuffer framebuffer,
             Extent2D extent,
             int colorAttachmentCount = 1,
+            int resolveAttachmentCount = 0,
             bool hasDepthAttachment = false,
             float clearDepth = 1f)
         {
             colorAttachmentCount = Math.Max(colorAttachmentCount, 1);
-            var clearValueCount = colorAttachmentCount + (hasDepthAttachment ? 1 : 0);
+            resolveAttachmentCount = Math.Max(resolveAttachmentCount, 0);
+            // Clear values are indexed by render-pass attachment, not logical
+            // color output.  Native MSAA adds a resolve attachment after every
+            // multisample color attachment, before the optional depth plane.
+            var depthAttachmentIndex = colorAttachmentCount + resolveAttachmentCount;
+            var clearValueCount = depthAttachmentIndex + (hasDepthAttachment ? 1 : 0);
             var clearValues = stackalloc ClearValue[clearValueCount];
             for (var index = 0; index < colorAttachmentCount; index++)
             {
@@ -14503,7 +15587,7 @@ internal static unsafe class VulkanVideoPresenter
             // LessOrEqual/Less test keeps the nearest fragment.
             if (hasDepthAttachment)
             {
-                clearValues[colorAttachmentCount] = new ClearValue
+                clearValues[depthAttachmentIndex] = new ClearValue
                 {
                     DepthStencil = new ClearDepthStencilValue(clearDepth, 0),
                 };
@@ -14558,6 +15642,14 @@ internal static unsafe class VulkanVideoPresenter
                 drawViewport.Y += ViewportDebugEpsilon;
             }
             _vk.CmdSetViewport(_commandBuffer, 0, 1, &drawViewport);
+            if (resources.Raster.DepthBiasEnable)
+            {
+                _vk.CmdSetDepthBias(
+                    _commandBuffer,
+                    resources.Raster.DepthBiasConstantFactor,
+                    resources.Raster.DepthBiasClamp,
+                    resources.Raster.DepthBiasSlopeFactor);
+            }
             // CB_BLEND_RED..ALPHA feed the CONSTANT_COLOR/CONSTANT_ALPHA factors.
             var blendConstants = stackalloc float[4]
             {
@@ -14698,6 +15790,13 @@ internal static unsafe class VulkanVideoPresenter
                     guestImage.InitialUploadPending = false;
                 }
             }
+
+            foreach (var (buffer, memory) in resources.AliasTransferBuffers)
+            {
+                _vk.DestroyBuffer(_device, buffer, null);
+                _vk.FreeMemory(_device, memory, null);
+            }
+            resources.AliasTransferBuffers.Clear();
 
             foreach (var globalBuffer in resources.GlobalMemoryBuffers)
             {

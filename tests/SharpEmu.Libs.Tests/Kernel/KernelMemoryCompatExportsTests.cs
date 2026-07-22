@@ -61,6 +61,51 @@ public sealed class KernelMemoryCompatExportsTests
     }
 
     [Fact]
+    public void DirectMemoryQuery_NextPastLastAllocationReturnsTerminalRange()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        const ulong infoAddress = memoryBase + 0x400;
+        const ulong queryOffset = 0x3FFF_00000;
+        const ulong directMemoryEnd = 0x4_0000_0000;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = queryOffset;
+        context[CpuRegister.Rsi] = 1; // next allocation
+        context[CpuRegister.Rdx] = infoAddress;
+        context[CpuRegister.Rcx] = 24;
+
+        Assert.Equal(0, KernelMemoryCompatExports.KernelDirectMemoryQuery(context));
+        Assert.True(context.TryReadUInt64(infoAddress, out var start));
+        Assert.True(context.TryReadUInt64(infoAddress + 8, out var end));
+        Assert.True(context.TryReadUInt32(infoAddress + 16, out var memoryType));
+        Assert.Equal(directMemoryEnd, start);
+        Assert.Equal(directMemoryEnd, end);
+        Assert.Equal(0u, memoryType);
+    }
+
+    [Fact]
+    public void PageTableStats_ReportKytyPoolCapacity()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = memoryBase + 0x100;
+        context[CpuRegister.Rsi] = memoryBase + 0x104;
+        context[CpuRegister.Rdx] = memoryBase + 0x108;
+        context[CpuRegister.Rcx] = memoryBase + 0x10C;
+
+        Assert.Equal(0, KernelMemoryCompatExports.KernelGetPageTableStats(context));
+        Assert.True(context.TryReadUInt32(memoryBase + 0x100, out var cpuTotal));
+        Assert.True(context.TryReadUInt32(memoryBase + 0x104, out var cpuAvailable));
+        Assert.True(context.TryReadUInt32(memoryBase + 0x108, out var gpuTotal));
+        Assert.True(context.TryReadUInt32(memoryBase + 0x10C, out var gpuAvailable));
+        Assert.Equal(2048u, cpuTotal);
+        Assert.Equal(2048u, gpuTotal);
+        Assert.InRange(cpuAvailable, 0u, cpuTotal);
+        Assert.InRange(gpuAvailable, 0u, gpuTotal);
+    }
+
+    [Fact]
     public void PosixFstat_BadDescriptorReturnsMinusOne()
     {
         const ulong memoryBase = 0x1_0000_0000;
@@ -347,6 +392,22 @@ public sealed class KernelMemoryCompatExportsTests
         var result = KernelMemoryCompatExports.KernelMprotect(context);
 
         Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND, result);
+    }
+
+    [Fact]
+    public void VirtualQuery_RequiresExactKytyInfoSize()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = memoryBase;
+        context[CpuRegister.Rsi] = 0;
+        context[CpuRegister.Rdx] = memoryBase + 0x200;
+        context[CpuRegister.Rcx] = 73; // KernelVirtualQueryInfo is exactly 72 bytes.
+
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT,
+            KernelMemoryCompatExports.KernelVirtualQuery(context));
     }
 
     [Fact]

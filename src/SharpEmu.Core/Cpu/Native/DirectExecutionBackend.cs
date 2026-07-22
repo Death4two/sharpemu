@@ -214,6 +214,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private nint _guestReturnStub;
 
+	// Resumes a guest import reached by a tail jump from a framed wrapper.
+	// Its machine code is exactly `mov rsp, rbp; pop rbp; ret`.
+	private nint _tailCallFrameUnwindStub;
+
 	private nint _rawExceptionHandler;
 
 	private nint _rawExceptionHandlerStub;
@@ -1089,9 +1093,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 		_unresolvedReturnStub = CreateUnresolvedReturnStub();
 		_guestReturnStub = CreateGuestReturnStub();
-		if (_guestReturnStub == 0)
+		_tailCallFrameUnwindStub = CreateTailCallFrameUnwindStub();
+		if (_guestReturnStub == 0 || _tailCallFrameUnwindStub == 0)
 		{
-			throw new OutOfMemoryException("Failed to allocate guest return stub");
+			throw new OutOfMemoryException("Failed to allocate guest return stubs");
 		}
 		SetupExceptionHandler();
 	}
@@ -2406,6 +2411,37 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			return 0;
 		}
 		FlushInstructionCache(GetCurrentProcess(), ptr, (nuint)offset);
+		return (nint)ptr;
+	}
+
+	private unsafe static nint CreateTailCallFrameUnwindStub()
+	{
+		const uint stubSize = 16u;
+		void* ptr = VirtualAlloc(null, stubSize, 12288u, 64u);
+		if (ptr == null)
+		{
+			return 0;
+		}
+
+		var code = (byte*)ptr;
+		code[0] = 0x48; // mov rsp, rbp
+		code[1] = 0x89;
+		code[2] = 0xEC;
+		code[3] = 0x5D; // pop rbp
+		code[4] = 0xC3; // ret
+		for (var index = 5; index < stubSize; index++)
+		{
+			code[index] = 0xCC;
+		}
+
+		uint oldProtect = 0;
+		if (!VirtualProtect(ptr, stubSize, 32u, &oldProtect))
+		{
+			VirtualFree(ptr, 0u, 32768u);
+			return 0;
+		}
+
+		FlushInstructionCache(GetCurrentProcess(), ptr, stubSize);
 		return (nint)ptr;
 	}
 
@@ -5643,7 +5679,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			int num6 = -1;
 			try
 			{
-				num6 = CallNativeEntry(ptr);
+				// Kyty's RunEntry enters guest code from a clean native frame. Do
+				// the same through our raw OS-thread executor: calling the emitted
+				// guest stub directly from this CLR frame can fail-fast once a
+				// tail-call unwind crosses an import boundary.
+				num6 = RunGuestEntryStub(ptr, num2, requireNativeWorker: true);
 				Console.Error.WriteLine($"[LOADER][INFO] Guest returned: {num6}");
 				// A host stop has already invalidated the session. Draining guest
 				// continuations here can re-enter a blocked HLE call after its owner
@@ -6465,6 +6505,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			VirtualFree((void*)_guestReturnStub, 0u, 32768u);
 			_guestReturnStub = 0;
+		}
+		if (_tailCallFrameUnwindStub != 0)
+		{
+			VirtualFree((void*)_tailCallFrameUnwindStub, 0u, 32768u);
+			_tailCallFrameUnwindStub = 0;
 		}
 		if (_guestContextTransferStub != 0)
 		{

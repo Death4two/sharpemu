@@ -102,7 +102,11 @@ internal readonly record struct GuestRasterState(
     bool CullFront,
     bool CullBack,
     bool FrontFaceClockwise,
-    bool Wireframe)
+    bool Wireframe,
+    bool DepthBiasEnable = false,
+    float DepthBiasConstantFactor = 0f,
+    float DepthBiasClamp = 0f,
+    float DepthBiasSlopeFactor = 0f)
 {
     public static GuestRasterState Default { get; } = new(false, false, false, false);
 }
@@ -158,7 +162,8 @@ internal sealed record GuestRenderState(
     GuestViewport? Viewport,
     GuestRasterState Raster,
     GuestDepthState Depth,
-    GuestBlendConstant BlendConstant = default)
+    GuestBlendConstant BlendConstant = default,
+    bool DepthClipEnabled = true)
 {
     public static GuestRenderState Default { get; } = new(
         [GuestBlendState.Default],
@@ -178,7 +183,9 @@ internal sealed record GuestRenderTarget(
     uint Height,
     uint Format,
     uint NumberType,
-    uint MipLevels = 1);
+    uint MipLevels = 1,
+    // Native PS5 MSAA is encoded as a log2 count in CB_COLOR_ATTRIB.
+    uint Samples = 1);
 
 /// <summary>Guest DB surface bound alongside a color render target.</summary>
 internal sealed record GuestDepthTarget(
@@ -189,7 +196,16 @@ internal sealed record GuestDepthTarget(
     uint GuestFormat,
     uint SwizzleMode,
     float ClearDepth,
-    bool ReadOnly)
+    bool ReadOnly,
+    // PS5 keeps stencil in an independently addressed byte plane.  Keeping
+    // this at the backend seam lets a storage descriptor retire only the
+    // overlapping prefix instead of accidentally taking ownership of depth.
+    ulong StencilReadAddress = 0,
+    ulong StencilWriteAddress = 0,
+    ulong StencilSize = 0,
+    bool StencilAccess = false,
+    uint Samples = 1)
 {
     public ulong Address => WriteAddress != 0 ? WriteAddress : ReadAddress;
+    public ulong StencilAddress => StencilWriteAddress != 0 ? StencilWriteAddress : StencilReadAddress;
 }

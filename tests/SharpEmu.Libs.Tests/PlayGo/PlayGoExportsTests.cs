@@ -18,6 +18,7 @@ public sealed class PlayGoStateCollection
 public sealed class PlayGoExportsTests : IDisposable
 {
     private const int BadChunkId = unchecked((int)0x80B2000C);
+    private const int BadLocus = unchecked((int)0x80B20010);
     private const byte LocusNotDownloaded = 0;
     private const byte LocusLocalFast = 3;
     private const ulong MemoryBase = 0x1_0000_0000;
@@ -26,6 +27,7 @@ public sealed class PlayGoExportsTests : IDisposable
     private const ulong HandleAddress = MemoryBase + 0x200;
     private const ulong ChunkIdsAddress = MemoryBase + 0x300;
     private const ulong LociAddress = MemoryBase + 0x400;
+    private const ulong TodoListAddress = MemoryBase + 0x500;
 
     private readonly string? _originalApp0Root;
     private readonly string _app0Root;
@@ -130,6 +132,35 @@ public sealed class PlayGoExportsTests : IDisposable
         Assert.Equal(new byte[] { 0xA5 }, ReadLoci(1));
     }
 
+    [Fact]
+    public void SetToDoList_ValidatesGuestEntriesLikeKyty()
+    {
+        var handle = InitializeAndOpen();
+        WriteTodoEntries([(0, LocusLocalFast)]);
+
+        SetTodoArguments(handle, TodoListAddress, 1);
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_OK,
+            PlayGoExports.PlayGoSetToDoList(_ctx));
+
+        WriteTodoEntries([(1, LocusLocalFast)]);
+        Assert.Equal(BadChunkId, PlayGoExports.PlayGoSetToDoList(_ctx));
+
+        WriteTodoEntries([(0, 1)]);
+        Assert.Equal(BadLocus, PlayGoExports.PlayGoSetToDoList(_ctx));
+    }
+
+    [Fact]
+    public void SetToDoList_FaultingEntryReturnsMemoryFault()
+    {
+        var handle = InitializeAndOpen();
+        SetTodoArguments(handle, 0xDEAD_0000_0000, 1);
+
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT,
+            PlayGoExports.PlayGoSetToDoList(_ctx));
+    }
+
     public void Dispose()
     {
         PlayGoExports.ResetForTests();
@@ -198,6 +229,26 @@ public sealed class PlayGoExportsTests : IDisposable
         _ctx[CpuRegister.Rsi] = chunkIds;
         _ctx[CpuRegister.Rdx] = count;
         _ctx[CpuRegister.Rcx] = outLoci;
+    }
+
+    private void WriteTodoEntries((ushort ChunkId, byte Locus)[] entries)
+    {
+        var bytes = new byte[entries.Length * 4];
+        for (var index = 0; index < entries.Length; index++)
+        {
+            var entry = bytes.AsSpan(index * 4, 4);
+            BinaryPrimitives.WriteUInt16LittleEndian(entry, entries[index].ChunkId);
+            entry[2] = entries[index].Locus;
+        }
+
+        Assert.True(_memory.TryWrite(TodoListAddress, bytes));
+    }
+
+    private void SetTodoArguments(uint handle, ulong todoList, uint count)
+    {
+        _ctx[CpuRegister.Rdi] = handle;
+        _ctx[CpuRegister.Rsi] = todoList;
+        _ctx[CpuRegister.Rdx] = count;
     }
 
     public enum UnusableMetadataKind

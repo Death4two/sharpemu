@@ -156,6 +156,23 @@ public static class PadExports
             : ctx.SetReturn(OrbisPadErrorInvalidHandle);
     }
 
+    // Kyty's controller implementation accepts this state toggle for the
+    // primary controller and rejects every other handle. The host input path
+    // has no IMU angular-velocity feed yet, but retaining the requested
+    // deadband state is unnecessary until that feed exists.
+    [SysAbiExport(
+        Nid = "r44mAxdSG+U",
+        ExportName = "scePadSetAngularVelocityDeadbandState",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadSetAngularVelocityDeadbandState(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        return IsPrimaryPadHandle(handle)
+            ? ctx.SetReturn(0)
+            : ctx.SetReturn(OrbisPadErrorInvalidHandle);
+    }
+
     [SysAbiExport(
         Nid = "vDLMoJLde8I",
         ExportName = "scePadSetTiltCorrectionState",

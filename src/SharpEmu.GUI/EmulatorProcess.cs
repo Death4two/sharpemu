@@ -18,7 +18,15 @@ internal sealed class EmulatorProcess : IDisposable
     public const int HostStopExitCode = -2;
 
     private const uint ExtendedStartupInfoPresent = 0x00080000;
+    private const uint CreateSuspended = 0x00000004;
     private const uint CreateNoWindow = 0x08000000;
+    private const uint MemReserve = 0x00002000;
+    private const uint PageNoAccess = 0x01;
+    private const ulong Ps5MainImageBase = 0x0000000800000000UL;
+    // Must match the CLI child reservation and leave room for large retail SELF images.
+    private const ulong Ps5MainImageWindowSize = 0x10000000UL;
+    private const ulong Ps5ApplicationHeapBase = 0x0000000600000000UL;
+    private const ulong Ps5ApplicationHeapSize = 0x0000000100000000UL;
     private const int StartfUseStdHandles = 0x00000100;
     private const uint HandleFlagInherit = 0x00000001;
     private const uint Infinite = 0xFFFFFFFF;
@@ -28,6 +36,12 @@ internal sealed class EmulatorProcess : IDisposable
     private const string MitigatedChildFlag = "--sharpemu-mitigated-child";
     private const string MitigatedChildEnvironment = "SHARPEMU_MITIGATED_CHILD";
     private const ulong ControlFlowGuardAlwaysOff = 0x00000002UL << 40;
+    // Preserve the PS5 fixed main-image window at 0x800000000. Without these
+    // child-process policies the CLR may reserve across it before SelfLoader
+    // can map the guest image.
+    private const ulong ForceRelocateImagesAlwaysOff = 0x00000002UL << 8;
+    private const ulong BottomUpAslrAlwaysOff = 0x00000002UL << 16;
+    private const ulong HighEntropyAslrAlwaysOff = 0x00000002UL << 24;
     private const ulong CetUserShadowStacksAlwaysOff = 0x00000002UL << 28;
     private const ulong UserCetSetContextIpValidationAlwaysOff = 0x00000002UL << 32;
 
@@ -214,7 +228,13 @@ internal sealed class EmulatorProcess : IDisposable
             }
 
             mitigationPolicies = Marshal.AllocHGlobal(sizeof(ulong) * 2);
-            Marshal.WriteInt64(mitigationPolicies, unchecked((long)ControlFlowGuardAlwaysOff));
+            Marshal.WriteInt64(
+                mitigationPolicies,
+                unchecked((long)(
+                    ControlFlowGuardAlwaysOff |
+                    ForceRelocateImagesAlwaysOff |
+                    BottomUpAslrAlwaysOff |
+                    HighEntropyAslrAlwaysOff)));
             Marshal.WriteInt64(
                 nint.Add(mitigationPolicies, sizeof(long)),
                 unchecked((long)(CetUserShadowStacksAlwaysOff | UserCetSetContextIpValidationAlwaysOff)));
@@ -253,7 +273,7 @@ internal sealed class EmulatorProcess : IDisposable
                             0,
                             0,
                             true,
-                            ExtendedStartupInfoPresent | CreateNoWindow,
+                            ExtendedStartupInfoPresent | CreateNoWindow | CreateSuspended,
                             0,
                             string.IsNullOrWhiteSpace(workingDirectory)
                                 ? Path.GetDirectoryName(exePath) ?? Environment.CurrentDirectory
@@ -272,6 +292,38 @@ internal sealed class EmulatorProcess : IDisposable
 
             processHandle = processInfo.Process;
             threadHandle = processInfo.Thread;
+            var fixedWindow = VirtualAllocEx(
+                processHandle,
+                unchecked((nint)Ps5MainImageBase),
+                (nuint)Ps5MainImageWindowSize,
+                MemReserve,
+                PageNoAccess);
+            if ((ulong)fixedWindow != Ps5MainImageBase)
+            {
+                throw new InvalidOperationException(
+                    $"Could not reserve the fixed PS5 image window in the emulator process " +
+                    $"(Win32 error {Marshal.GetLastWin32Error()}).");
+            }
+
+            var applicationHeapWindow = VirtualAllocEx(
+                processHandle,
+                unchecked((nint)Ps5ApplicationHeapBase),
+                unchecked((nuint)Ps5ApplicationHeapSize),
+                MemReserve,
+                PageNoAccess);
+            if ((ulong)applicationHeapWindow != Ps5ApplicationHeapBase)
+            {
+                throw new InvalidOperationException(
+                    $"Could not reserve the fixed PS5 application-heap window in the emulator process " +
+                    $"(Win32 error {Marshal.GetLastWin32Error()}).");
+            }
+
+            if (ResumeThread(threadHandle) == uint.MaxValue)
+            {
+                throw new InvalidOperationException(
+                    $"Could not resume the emulator process (Win32 error {Marshal.GetLastWin32Error()}).");
+            }
+
             CloseHandle(stdoutWrite);
             stdoutWrite = 0;
             CloseHandle(stderrWrite);
@@ -630,6 +682,12 @@ internal sealed class EmulatorProcess : IDisposable
     [DllImport("kernel32.dll", EntryPoint = "CreateProcessW", SetLastError = true, CharSet = CharSet.Unicode)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CreateProcessW(string? applicationName, StringBuilder commandLine, nint processAttributes, nint threadAttributes, [MarshalAs(UnmanagedType.Bool)] bool inheritHandles, uint flags, nint environment, string currentDirectory, ref StartupInfoEx startupInfo, out ProcessInformation processInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern nint VirtualAllocEx(nint process, nint address, nuint size, uint allocationType, uint protection);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint ResumeThread(nint thread);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern uint WaitForSingleObject(nint handle, uint milliseconds);

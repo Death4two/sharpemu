@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using SharpEmu.HLE;
 using SharpEmu.Libs.Kernel;
 using Xunit;
 
@@ -11,6 +12,16 @@ namespace SharpEmu.Libs.Tests.Kernel;
 // otherwise falls back to the QPC-based Stopwatch, so the frequency selection has to follow suit.
 public sealed class KernelRuntimeCompatExportsTests
 {
+    [Fact]
+    public void LibcIsSignalReturn_IsFalseWithoutGuestSignalTrampoline()
+    {
+        var context = new CpuContext(new FakeCpuMemory(0x1_0000_0000, 0x1000), Generation.Gen5);
+        context[CpuRegister.Rdi] = 0x8000_0000;
+
+        Assert.Equal(0, KernelRuntimeCompatExports.LibcIsSignalReturn(context));
+        Assert.Equal(0UL, context[CpuRegister.Rax]);
+    }
+
     private static KernelRuntimeCompatExports.TryGetFrequency Yields(ulong hz) =>
         (out ulong frequencyHz) =>
         {
@@ -24,6 +35,92 @@ public sealed class KernelRuntimeCompatExportsTests
             frequencyHz = 0;
             return false;
         };
+
+    [Fact]
+    public void RtldApplicationHeapApi_PreservesRaxForVoidAbiCall()
+    {
+        const ulong memoryBase = 0x0000_7FFF_4000_0000;
+        const ulong apiAddress = memoryBase + 0x100;
+        const ulong preservedRax = 0x0123_4567_89AB_CDEF;
+        var context = new CpuContext(new FakeCpuMemory(memoryBase, 0x1000), Generation.Gen5);
+        for (var index = 0; index < 10; index++)
+        {
+            Assert.True(context.TryWriteUInt64(
+                apiAddress + ((ulong)index * sizeof(ulong)),
+                0x0000_0008_0000_0000UL + (ulong)index));
+        }
+
+        context[CpuRegister.Rdi] = apiAddress;
+        context[CpuRegister.Rax] = preservedRax;
+
+        Assert.Equal(0, KernelRuntimeCompatExports.KernelRtldSetApplicationHeapApi(context));
+        Assert.Equal(preservedRax, context[CpuRegister.Rax]);
+    }
+
+    [Fact]
+    public void GetOpenPsId_WritesKytyCompatibleOpaqueIdentifier()
+    {
+        const ulong memoryBase = 0x0000_7FFF_4000_0000;
+        const ulong outputAddress = memoryBase + 0x100;
+        var context = new CpuContext(new FakeCpuMemory(memoryBase, 0x1000), Generation.Gen5);
+        context[CpuRegister.Rdi] = outputAddress;
+
+        Assert.Equal(0, KernelRuntimeCompatExports.KernelGetOpenPsId(context));
+        Span<byte> identifier = stackalloc byte[16];
+        Assert.True(context.Memory.TryRead(outputAddress, identifier));
+        Assert.Equal("KytyOpenPsId", System.Text.Encoding.ASCII.GetString(identifier[..12]));
+        Assert.Equal((byte)1, identifier[15]);
+    }
+
+    [Fact]
+    public void GetTimezone_WritesKytyLayout()
+    {
+        const ulong memoryBase = 0x0000_7FFF_4000_0000;
+        const ulong outputAddress = memoryBase + 0x100;
+        var context = new CpuContext(new FakeCpuMemory(memoryBase, 0x1000), Generation.Gen5);
+        context[CpuRegister.Rdi] = outputAddress;
+
+        Assert.Equal(0, KernelRuntimeCompatExports.KernelGetTimezone(context));
+        Assert.True(context.TryReadUInt32(outputAddress, out var minutesWest));
+        Assert.True(context.TryReadUInt32(outputAddress + sizeof(int), out var dstTime));
+        Assert.InRange(unchecked((int)minutesWest), -14 * 60, 14 * 60);
+        Assert.InRange(dstTime, 0u, 1u);
+    }
+
+    [Fact]
+    public void BasePs5ModeAndCurrentCpuMatchKyty()
+    {
+        var context = new CpuContext(new FakeCpuMemory(0x0000_7FFF_4000_0000, 0x1000), Generation.Gen5);
+
+        Assert.Equal(0, KernelRuntimeCompatExports.KernelIsTrinityMode(context));
+        Assert.Equal(0UL, context[CpuRegister.Rax]);
+        Assert.Equal(0, KernelRuntimeCompatExports.KernelGetCurrentCpu(context));
+        Assert.Equal(0UL, context[CpuRegister.Rax]);
+    }
+
+    [Fact]
+    public void PrtAperture_QueryReturnsValueSetThroughKytyAbi()
+    {
+        const ulong memoryBase = 0x0000_7FFF_4000_0000;
+        const ulong apertureBase = 0x0000_0010_0000_0000;
+        const ulong apertureSize = 0x0020_0000;
+        const ulong baseOutput = memoryBase + 0x100;
+        const ulong sizeOutput = memoryBase + 0x108;
+        var context = new CpuContext(new FakeCpuMemory(memoryBase, 0x1000), Generation.Gen5);
+        context[CpuRegister.Rdi] = 1;
+        context[CpuRegister.Rsi] = apertureBase;
+        context[CpuRegister.Rdx] = apertureSize;
+        Assert.Equal(0, KernelRuntimeCompatExports.KernelSetPrtAperture(context));
+
+        context[CpuRegister.Rdi] = 1;
+        context[CpuRegister.Rsi] = baseOutput;
+        context[CpuRegister.Rdx] = sizeOutput;
+        Assert.Equal(0, KernelRuntimeCompatExports.KernelGetPrtAperture(context));
+        Assert.True(context.TryReadUInt64(baseOutput, out var actualBase));
+        Assert.True(context.TryReadUInt64(sizeOutput, out var actualSize));
+        Assert.Equal(apertureBase, actualBase);
+        Assert.Equal(apertureSize, actualSize);
+    }
 
     [Fact]
     public void WithoutHostRdtsc_ReportsStopwatchFrequency_NotHardwareTsc()

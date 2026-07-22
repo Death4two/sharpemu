@@ -468,6 +468,109 @@ internal static class GnmTiling
         return true;
     }
 
+    /// <summary>
+    /// Swizzles a linear row-major surface into its GFX10 tiled guest layout.
+    /// This is the exact inverse of <see cref="TryDetile"/> for the supported
+    /// 2D modes and lets GPU-owned resources be published back to guest memory
+    /// without treating a tiled allocation as linear bytes.
+    /// </summary>
+    public static bool TryTile(
+        ReadOnlySpan<byte> linear,
+        Span<byte> tiled,
+        uint swizzleMode,
+        int elementsWide,
+        int elementsHigh,
+        int bytesPerElement,
+        bool clearTiled = true)
+    {
+        if (!ShouldDetile(swizzleMode) || elementsWide <= 0 || elementsHigh <= 0 || bytesPerElement <= 0)
+        {
+            return false;
+        }
+
+        if (!TryGetSwizzleKind(swizzleMode, out var kind, out var blockBytes))
+        {
+            ReportUnsupported(swizzleMode);
+            return false;
+        }
+
+        var bppLog2 = BitLog2((uint)bytesPerElement);
+        if (bppLog2 < 0)
+        {
+            ReportUnsupported(swizzleMode);
+            return false;
+        }
+
+        var blockElements = blockBytes >> bppLog2;
+        var (blockWidth, blockHeight) = SquareBlockDimensions(blockElements);
+        if (blockWidth == 0 || blockHeight == 0)
+        {
+            ReportUnsupported(swizzleMode);
+            return false;
+        }
+
+        var blocksPerRow = (elementsWide + blockWidth - 1) / blockWidth;
+        var requiredLinear = (long)elementsWide * elementsHigh * bytesPerElement;
+        if (linear.Length < requiredLinear)
+        {
+            return false;
+        }
+
+        if (clearTiled)
+        {
+            tiled.Clear();
+        }
+
+        var hasExactXorPattern = TryGetExactXorPattern(swizzleMode, bppLog2, out var xorPattern);
+        var blockTable = hasExactXorPattern ? [] : new int[blockWidth * blockHeight];
+        for (var by = 0; !hasExactXorPattern && by < blockHeight; by++)
+        {
+            for (var bx = 0; bx < blockWidth; bx++)
+            {
+                blockTable[by * blockWidth + bx] = (int)(kind == SwizzleKind.ZOrder
+                    ? MortonInterleave((uint)bx, (uint)by, blockWidth, blockHeight)
+                    : StandardSwizzleOffset((uint)bx, (uint)by, blockWidth, blockHeight));
+            }
+        }
+
+        var xTermByColumn = hasExactXorPattern ? new int[elementsWide] : [];
+        for (var x = 0; hasExactXorPattern && x < elementsWide; x++)
+        {
+            xTermByColumn[x] = (int)PatternAxisTerm((uint)x, xorPattern, useX: true);
+        }
+
+        for (var y = 0; y < elementsHigh; y++)
+        {
+            var blockY = y / blockHeight;
+            var inBlockY = y % blockHeight;
+            var rowBlockBase = (long)blockY * blocksPerRow;
+            var tableRowBase = inBlockY * blockWidth;
+            var sourceRowBase = (long)y * elementsWide * bytesPerElement;
+            var yTerm = hasExactXorPattern ? (int)PatternAxisTerm((uint)y, xorPattern, useX: false) : 0;
+            for (var x = 0; x < elementsWide; x++)
+            {
+                var blockX = x / blockWidth;
+                var inBlockX = x % blockWidth;
+                var blockIndex = rowBlockBase + blockX;
+                var destinationByte = hasExactXorPattern
+                    ? blockIndex * blockBytes + (xTermByColumn[x] ^ yTerm)
+                    : (blockIndex * blockElements + blockTable[tableRowBase + inBlockX]) *
+                      (long)bytesPerElement;
+                var sourceByte = sourceRowBase + (long)x * bytesPerElement;
+                if (sourceByte + bytesPerElement > linear.Length ||
+                    destinationByte + bytesPerElement > tiled.Length)
+                {
+                    continue;
+                }
+
+                linear.Slice((int)sourceByte, bytesPerElement)
+                    .CopyTo(tiled.Slice((int)destinationByte, bytesPerElement));
+            }
+        }
+
+        return true;
+    }
+
     private enum SwizzleKind
     {
         Standard,

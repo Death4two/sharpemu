@@ -423,6 +423,21 @@ public static partial class Gen5SpirvTranslator
                 case "VAddU32":
                     result = EmitIntegerBinary(instruction, SpirvOp.IAdd);
                     break;
+                case "VSadU32":
+                {
+                    // V_SAD_U32: |src0 - src1| + src2.  Keep the subtraction
+                    // unsigned and select its direction before adding the
+                    // accumulator; this is also the PS5 NGG vertex-index
+                    // offset idiom used by embedded fetch shaders.
+                    var left = GetRawSource(instruction, 0);
+                    var right = GetRawSource(instruction, 1);
+                    var difference = SelectU(
+                        UCmp(SpirvOp.UGreaterThanEqual, left, right),
+                        ISubU(left, right),
+                        ISubU(right, left));
+                    result = IAdd(difference, GetRawSource(instruction, 2));
+                    break;
+                }
                 case "VAddcU32":
                 case "VAddCoCiU32":
                     result = EmitAddWithCarry(instruction);

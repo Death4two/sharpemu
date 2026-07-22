@@ -23,6 +23,7 @@ namespace SharpEmu.Libs.Tests.Agc;
 public sealed class Gen5FmaMixSpirvTests
 {
     private const ulong ShaderAddress = 0x1_0000_0000;
+    private const ushort SpirvUGreaterThanEqual = 174;
 
     // GLSL.std.450 extended-instruction numbers used by the lowering.
     private const uint GlslFma = 50;
@@ -59,6 +60,20 @@ public sealed class Gen5FmaMixSpirvTests
         Assert.True(
             ContainsExtInst(spirv, GlslFma),
             "V_FMA_MIXLO_F16 must still lower its multiply-add to a GLSL.std.450 Fma");
+    }
+
+    [Fact]
+    public void SadU32_TranslatesUnsignedAbsoluteDifferenceAndAddend()
+    {
+        // v_sad_u32 v5, s18, 0, v5
+        // This is the NGG vertex-offset accumulator form emitted by PS5
+        // embedded fetch shaders.  It must not reach the vector-ALU fallback.
+        var spirv = Compile([0xD55D0005u, 0x04150012u]);
+
+        Assert.True(
+            EnumerateInstructions(spirv).Any(static instruction =>
+                instruction.Op == SpirvUGreaterThanEqual),
+            "V_SAD_U32 must choose the unsigned subtraction direction before adding src2.");
     }
 
     // True when the module contains an OpExtInst selecting the given GLSL.std.450

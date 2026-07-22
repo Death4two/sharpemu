@@ -55,6 +55,18 @@ internal static class KernelVirtualRangeAllocator
                 return true;
             }
 
+            // A fixed application-heap range can already be a host reservation
+            // created outside the managed region table.  Do not try to reserve
+            // it a second time: on Windows that necessarily fails even though
+            // the range is exactly what mprotect is about to activate.  Commit
+            // it in place first, matching Kyty's reserved-range transition.
+            if (backPartialOverlap &&
+                addressSpace.TryCommitFixedRange(desiredAddress, length, executable))
+            {
+                mappedAddress = desiredAddress;
+                return true;
+            }
+
             var allocated = addressSpace.AllocateAt(desiredAddress, length, executable, allowAllocateAtAlternative);
             if (allocated == 0)
             {
@@ -65,12 +77,12 @@ internal static class KernelVirtualRangeAllocator
             mappedAddress = allocated;
             return true;
         }
-        catch
+        catch (Exception exception)
         {
             // Expected when a fixed-address request cannot be satisfied on
             // this host; the caller falls back or reports the failure.
             Console.Error.WriteLine(
-                $"[LOADER][TRACE] {traceName}: no host mapping at 0x{desiredAddress:X16} len=0x{length:X}");
+                $"[LOADER][TRACE] {traceName}: no host mapping at 0x{desiredAddress:X16} len=0x{length:X} ({exception.GetType().Name}: {exception.Message})");
             return false;
         }
     }

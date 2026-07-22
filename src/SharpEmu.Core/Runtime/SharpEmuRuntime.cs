@@ -14,6 +14,7 @@ using SharpEmu.Libs.SaveData;
 using SharpEmu.Libs.Fiber;
 using SharpEmu.Libs.SystemService;
 using System.Buffers.Binary;
+using System.IO.MemoryMappedFiles;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -75,6 +76,43 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
 
     public static ISharpEmuRuntime CreateDefault(SharpEmuRuntimeOptions options = default)
     {
+        // Claim the complete PS5 main-image window before Aerolib/export
+        // registration first-JITs enough managed code for the CLR to reserve
+        // across 0x800000000. The loader reuses and lazily commits this exact
+        // reservation, so the guest image is never relocated.
+        var virtualMemory = new PhysicalVirtualMemory();
+        const ulong ps5MainImageBase = 0x0000000800000000UL;
+        // Keep this in sync with the early CLI/GUI reservation.  A 64 MiB
+        // window cannot contain several retail PS5 images.
+        const ulong ps5MainImageWindowSize = 0x10000000UL;
+        const ulong ps5ApplicationHeapBase = 0x0000000600000000UL;
+        const ulong ps5ApplicationHeapSize = 0x0000000100000000UL;
+        if (OperatingSystem.IsWindows() &&
+            !virtualMemory.TryAdoptEarlyPersistentReservation(
+                ps5MainImageBase,
+                ps5MainImageWindowSize) &&
+            !virtualMemory.TryReservePersistentAtExact(
+                ps5MainImageBase,
+                ps5MainImageWindowSize))
+        {
+            Console.Error.WriteLine(
+                "[LOADER][WARN] Could not pre-reserve the fixed PS5 main-image window; " +
+                "the host may already have claimed it.");
+        }
+
+        if (OperatingSystem.IsWindows() &&
+            !virtualMemory.TryAdoptEarlyPersistentReservation(
+                ps5ApplicationHeapBase,
+                ps5ApplicationHeapSize) &&
+            !virtualMemory.TryReservePersistentAtExact(
+                ps5ApplicationHeapBase,
+                ps5ApplicationHeapSize))
+        {
+            Console.Error.WriteLine(
+                "[LOADER][WARN] Could not reserve the fixed PS5 application-heap window; " +
+                "fixed Unity TLSF pools may be unavailable.");
+        }
+
         var cpuExecutionOptions = new CpuExecutionOptions
         {
             CpuEngine = options.CpuEngine,
@@ -86,9 +124,10 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         // The compile-time generated registry (SharpEmu.SourceGenerators) is the sole
         // registration source; content tests in SharpEmu.Libs.Tests pin its invariants.
         moduleManager.RegisterExports(SharpEmu.Generated.SysAbiExportRegistry.CreateExports(Generation.Gen4 | Generation.Gen5));
-        moduleManager.Freeze();
-
-        var virtualMemory = new PhysicalVirtualMemory();
+        // The host CLR may reserve a large address range while JIT-warming
+        // HLE code. Load the fixed-base guest image first so that reservation
+        // cannot occupy the PS5 image window on Windows.
+        moduleManager.Freeze(warmUp: false);
 
         var fileSystem = new PhysicalFileSystem();
 
@@ -102,7 +141,7 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
             fileSystem);
     }
 
-    public SelfImage LoadImage(string ebootPath)
+    public unsafe SelfImage LoadImage(string ebootPath)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(ebootPath);
 
@@ -118,15 +157,35 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
             throw new NotSupportedException("Images larger than 2 GB are not currently supported.");
         }
 
-        var bytes = GC.AllocateUninitializedArray<byte>((int)fileInfo.Length);
-        using (var stream = File.OpenRead(fullPath))
-        {
-            stream.ReadExactly(bytes);
-        }
-
         var mountRoot = Path.GetDirectoryName(fullPath);
-
-        return _selfLoader.Load(bytes.AsSpan(), _virtualMemory, _moduleManager, _fileSystem, mountRoot);
+        using var mappedFile = MemoryMappedFile.CreateFromFile(
+            fullPath,
+            FileMode.Open,
+            mapName: null,
+            capacity: 0,
+            MemoryMappedFileAccess.Read);
+        using var view = mappedFile.CreateViewAccessor(
+            0,
+            fileInfo.Length,
+            MemoryMappedFileAccess.Read);
+        byte* pointer = null;
+        view.SafeMemoryMappedViewHandle.AcquirePointer(ref pointer);
+        try
+        {
+            var imageData = new ReadOnlySpan<byte>(
+                pointer + view.PointerOffset,
+                checked((int)fileInfo.Length));
+            return _selfLoader.Load(
+                imageData,
+                _virtualMemory,
+                _moduleManager,
+                _fileSystem,
+                mountRoot);
+        }
+        finally
+        {
+            view.SafeMemoryMappedViewHandle.ReleasePointer();
+        }
     }
 
     public OrbisGen2Result Run(string ebootPath)
@@ -142,6 +201,10 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         FiberExports.ResetRuntimeState();
         KernelModuleRegistry.Reset();
         var image = LoadImage(normalizedEbootPath);
+        if (_moduleManager is ModuleManager moduleManager)
+        {
+            moduleManager.EnsureWarmHleTypeInitializers();
+        }
         VideoOutExports.ConfigureApplicationInfo(image.Title, image.TitleId, image.Version);
         SaveDataExports.ConfigureApplicationInfo(image.TitleId);
         SystemServiceExports.ConfigureApplicationInfo(image.TitleId);

@@ -29,6 +29,7 @@ public static class PlayGoExports
     private const int PlayGoInstallSpeedSuspended = 0;
     private const int PlayGoInstallSpeedTrickle = 1;
     private const int PlayGoInstallSpeedFull = 2;
+    private const int PlayGoTodoEntrySize = sizeof(ushort) + sizeof(byte) + sizeof(byte);
     private const uint MaxPlayGoQueryEntries = 0x4000;
     private const uint PlayGoAllEntriesSentinel = uint.MaxValue;
 
@@ -631,9 +632,40 @@ public static class PlayGoExports
             return OrbisPlayGoErrorBadPointer;
         }
 
-        return numberOfEntries == 0
-            ? OrbisPlayGoErrorBadSize
-            : (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        if (numberOfEntries == 0 || numberOfEntries > MaxPlayGoQueryEntries)
+        {
+            return OrbisPlayGoErrorBadSize;
+        }
+
+        // ScePlayGoToDo is exactly { uint16_t chunk_id; int8_t locus;
+        // int8_t reserved; }.  Validate the guest list rather than accepting
+        // it as a no-op: titles use BAD_CHUNK_ID/BAD_LOCUS to select their
+        // installed-content fallback, matching Kyty's libPlayGo behavior.
+        Span<byte> locusBytes = stackalloc byte[sizeof(byte)];
+        for (uint index = 0; index < numberOfEntries; index++)
+        {
+            var entryAddress = todoList + (index * PlayGoTodoEntrySize);
+            if (!ctx.TryReadUInt16(entryAddress, out var chunkId) ||
+                !ctx.Memory.TryRead(entryAddress + sizeof(ushort), locusBytes))
+            {
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+            }
+
+            if (!IsKnownChunkId(chunkId))
+            {
+                return OrbisPlayGoErrorBadChunkId;
+            }
+
+            var locus = unchecked((sbyte)locusBytes[0]);
+            if (locus is not PlayGoLocusNotDownloaded and
+                not PlayGoLocusLocalSlow and
+                not PlayGoLocusLocalFast)
+            {
+                return OrbisPlayGoErrorBadLocus;
+            }
+        }
+
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
     private static int ValidateHandle(uint handle)

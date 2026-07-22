@@ -56,11 +56,17 @@ public sealed partial class DirectExecutionBackend
 	// Callers set the Active* thread-statics before emitting the stub and read the
 	// yield/forced-exit flags right after this returns, so the worker outcome is
 	// copied back into this thread's statics before returning.
-	private unsafe int RunGuestEntryStub(void* entryStub, ulong hostRspSlot)
+	private unsafe int RunGuestEntryStub(void* entryStub, ulong hostRspSlot, bool requireNativeWorker = false)
 	{
-		var worker = RentNativeGuestExecutor();
+		var worker = RentNativeGuestExecutor(ignoreDisabledSetting: requireNativeWorker);
 		if (worker is null)
 		{
+			if (requireNativeWorker && OperatingSystem.IsWindows())
+			{
+				throw new InvalidOperationException(
+					"The main guest entry requires a native executor; refusing unsafe CLR-inline guest execution.");
+			}
+
 			TlsSetValue(_hostRspSlotTlsIndex, (nint)hostRspSlot);
 			return CallNativeEntry(entryStub);
 		}
@@ -90,12 +96,12 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
-	private NativeGuestExecutor? RentNativeGuestExecutor()
+	private NativeGuestExecutor? RentNativeGuestExecutor(bool ignoreDisabledSetting = false)
 	{
 		// NativeGuestExecutor emits a Win32 wait loop and creates it with
 		// kernel32!CreateThread. POSIX hosts use the established inline entry
 		// path until the worker loop has a pthread/eventfd implementation.
-		if (!OperatingSystem.IsWindows() || NativeGuestWorkersDisabled)
+		if (!OperatingSystem.IsWindows() || (NativeGuestWorkersDisabled && !ignoreDisabledSetting))
 		{
 			return null;
 		}

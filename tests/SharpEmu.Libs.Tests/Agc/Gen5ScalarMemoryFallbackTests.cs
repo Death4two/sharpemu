@@ -110,4 +110,43 @@ public sealed class Gen5ScalarMemoryFallbackTests
             return true;
         }
     }
+
+    [Fact]
+    public void ScalarBufferLoad_NullBaseWithNonzeroSizeReadsZero()
+    {
+        var load = new Gen5ShaderInstruction(
+            0,
+            Gen5ShaderEncoding.Smem,
+            "SBufferLoadDwordx4",
+            [],
+            [Gen5Operand.Scalar(0)],
+            [
+                Gen5Operand.Scalar(16),
+                Gen5Operand.Scalar(17),
+                Gen5Operand.Scalar(18),
+                Gen5Operand.Scalar(19),
+            ],
+            new Gen5ScalarMemoryControl(0, 0, null));
+        var end = new Gen5ShaderInstruction(
+            8,
+            Gen5ShaderEncoding.Sopp,
+            "SEndpgm",
+            [], [], [], null);
+        // Null base plus a live size/format is emitted by Unity when an
+        // optional constant buffer is unbound. It must be an all-zero read.
+        var scalars = new uint[80];
+        scalars[2] = 0x100;
+        scalars[3] = 1;
+        var state = new Gen5ShaderState(
+            new Gen5ShaderProgram(0, [load, end]),
+            scalars,
+            null);
+        var context = new CpuContext(new FakeCpuMemory(0x1000, 0x100), Generation.Gen5);
+
+        Assert.True(
+            Gen5ShaderScalarEvaluator.TryEvaluate(context, state, out var evaluation, out var error),
+            error);
+        Assert.Equal(new uint[] { 0, 0, 0, 0 }, evaluation.ScalarRegisters.Skip(16).Take(4));
+        Assert.Empty(evaluation.GlobalMemoryBindings);
+    }
 }

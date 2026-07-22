@@ -81,4 +81,42 @@ public sealed class GnmTilingDetileTests
             Assert.Equal((ushort)i, value);
         }
     }
+
+    [Fact]
+    public void TryTile_ExactXorMode27_RoundTripsThroughDetile()
+    {
+        const uint swizzleMode = 27;
+        const int bytesPerElement = 2;
+        const int elementsWide = 384;
+        const int elementsHigh = 200;
+        const int blockBytes = 65536;
+        const int blockWidth = 256;
+        const int blockHeight = 128;
+        var blocksPerRow = (elementsWide + blockWidth - 1) / blockWidth;
+        var blocksPerColumn = (elementsHigh + blockHeight - 1) / blockHeight;
+        var linear = new byte[elementsWide * elementsHigh * bytesPerElement];
+        for (var index = 0; index < linear.Length; index++)
+        {
+            linear[index] = (byte)((index * 37 + 11) & 0xFF);
+        }
+
+        var tiled = new byte[blocksPerRow * blocksPerColumn * blockBytes];
+        Assert.True(GnmTiling.TryTile(
+            linear,
+            tiled,
+            swizzleMode,
+            elementsWide,
+            elementsHigh,
+            bytesPerElement));
+
+        var restored = new byte[linear.Length];
+        Assert.True(GnmTiling.TryDetile(
+            tiled,
+            restored,
+            swizzleMode,
+            elementsWide,
+            elementsHigh,
+            bytesPerElement));
+        Assert.Equal(linear, restored);
+    }
 }

@@ -1879,6 +1879,11 @@ public static class Gen5ShaderScalarEvaluator
         var bufferUnbound =
             isBufferLoad &&
             (!hasBufferDescriptor ||
+             // A buffer descriptor with a null base is an unbound resource
+             // even when its size field is stale/non-zero. Guest address zero
+             // is never mapped; hardware therefore yields zero components,
+             // rather than dereferencing it or rejecting the whole shader.
+             bufferDescriptor.BaseAddress == 0 ||
              bufferDescriptor.SizeBytes == 0 ||
              (scalarRegisters[scalarBase.Value] == 0 &&
               scalarRegisters[scalarBase.Value + 1] == 0 &&
@@ -1901,7 +1906,7 @@ public static class Gen5ShaderScalarEvaluator
                 dynamicOffset);
         }
         var bufferSize = ulong.MaxValue;
-        if (recordBinding && isBufferLoad)
+        if (recordBinding && isBufferLoad && !bufferUnbound)
         {
             bufferSize = hasBufferDescriptor ? bufferDescriptor.SizeBytes : ulong.MaxValue;
 

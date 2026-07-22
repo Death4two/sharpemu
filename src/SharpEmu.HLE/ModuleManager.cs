@@ -13,8 +13,10 @@ public sealed class ModuleManager : IModuleManager
     private readonly ConcurrentDictionary<string, ExportedFunction> _exportTable = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, ExportedFunction> _exportNameTable = new(StringComparer.Ordinal);
     private readonly object _registrationGate = new();
+    private readonly object _warmupGate = new();
     private readonly HashSet<Assembly> _warmupAssemblies = new();
     private bool _isFrozen;
+    private bool _warmupCompleted;
 
     public int RegisterExports(IReadOnlyList<ExportedFunction> exports)
     {
@@ -50,12 +52,39 @@ public sealed class ModuleManager : IModuleManager
 
     public void Freeze()
     {
+        Freeze(warmUp: true);
+    }
+
+    /// <summary>
+    /// Prevents further registrations and optionally warms guest-reachable HLE
+    /// code. The runtime defers the costly warmup until after the main image
+    /// has claimed its fixed address range on Windows.
+    /// </summary>
+    public void Freeze(bool warmUp)
+    {
         lock (_registrationGate)
         {
             _isFrozen = true;
         }
 
-        WarmHleTypeInitializers();
+        if (warmUp)
+        {
+            EnsureWarmHleTypeInitializers();
+        }
+    }
+
+    public void EnsureWarmHleTypeInitializers()
+    {
+        lock (_warmupGate)
+        {
+            if (_warmupCompleted)
+            {
+                return;
+            }
+
+            WarmHleTypeInitializers();
+            _warmupCompleted = true;
+        }
     }
 
     // A .cctor or first JIT running on a guest thread's hijacked stack fail-fasts the CLR.

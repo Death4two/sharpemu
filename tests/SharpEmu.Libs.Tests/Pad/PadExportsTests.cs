@@ -30,4 +30,17 @@ public sealed class PadExportsTests
         _ctx[CpuRegister.Rdi] = unchecked((ulong)handle);
         Assert.Equal(expected, PadExports.PadSetTiltCorrectionState(_ctx));
     }
+
+    [Theory]
+    [InlineData(0, 0)]
+    [InlineData(1, 0)]
+    [InlineData(2, InvalidHandle)]
+    [InlineData(-1, InvalidHandle)]
+    public void SetAngularVelocityDeadbandState_ValidatesHandle(int handle, int expected)
+    {
+        _ctx[CpuRegister.Rdi] = unchecked((ulong)handle);
+        _ctx[CpuRegister.Rsi] = 1;
+
+        Assert.Equal(expected, PadExports.PadSetAngularVelocityDeadbandState(_ctx));
+    }
 }

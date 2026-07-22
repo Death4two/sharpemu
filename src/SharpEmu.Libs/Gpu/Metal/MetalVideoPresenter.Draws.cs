@@ -761,6 +761,15 @@ internal static partial class MetalVideoPresenter
             encoder,
             MetalNative.Selector("setFrontFacingWinding:"),
             raster.FrontFaceClockwise ? 0 : 1);
+        // Render-encoder state persists across draws. Set zeroes explicitly
+        // when disabled so a prior polygon-offset draw cannot leak its depth
+        // bias into this one.
+        MetalNative.SendVoidFloat3(
+            encoder,
+            MetalNative.Selector("setDepthBias:slopeScale:clamp:"),
+            raster.DepthBiasEnable ? raster.DepthBiasConstantFactor : 0f,
+            raster.DepthBiasEnable ? raster.DepthBiasSlopeFactor : 0f,
+            raster.DepthBiasEnable ? raster.DepthBiasClamp : 0f);
         if (raster.Wireframe)
         {
             // MTLTriangleFillMode.Lines = 1.

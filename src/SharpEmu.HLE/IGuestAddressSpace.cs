@@ -26,6 +26,13 @@ public interface IGuestAddressSpace : IGuestMemoryAllocator
     /// </summary>
     bool TryBackFixedRange(ulong address, ulong size, bool executable);
 
+    /// <summary>
+    /// Commits an already-reserved fixed range without allocating an alternative
+    /// address. Used by guest mprotect-style APIs when an application heap has
+    /// reserved pages directly through its allocator callbacks.
+    /// </summary>
+    bool TryCommitFixedRange(ulong address, ulong size, bool executable);
+
     bool TryAllocateAtOrAbove(ulong desiredAddress, ulong size, bool executable, ulong alignment, out ulong actualAddress);
 
     bool TryProtect(ulong address, ulong size, GuestPageProtection protection);

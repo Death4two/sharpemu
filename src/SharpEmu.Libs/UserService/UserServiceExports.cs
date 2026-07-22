@@ -35,6 +35,19 @@ public static class UserServiceExports
     }
 
     [SysAbiExport(
+        Nid = "az-0R6eviZ0",
+        ExportName = "sceUserServiceInitialize2",
+        Target = Generation.Gen5,
+        LibraryName = "libSceUserService")]
+    public static int UserServiceInitialize2(CpuContext ctx)
+    {
+        // Kyty exposes Initialize2 as the parameterless Gen5 counterpart of
+        // sceUserServiceInitialize; both establish the same hosted user.
+        Trace("initialize2");
+        return SetReturn(ctx, 0);
+    }
+
+    [SysAbiExport(
         Nid = "CdWp0oHWGr0",
         ExportName = "sceUserServiceGetInitialUser",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -153,6 +166,25 @@ public static class UserServiceExports
         LibraryName = "libSceUserService")]
     public static int UserServiceGetUserNameAlt(CpuContext ctx) => UserServiceGetUserName(ctx);
     #pragma warning restore SHEM004
+
+    // Kyty exports this title-captured alias in addition to the canonical
+    // sceUserServiceGetUserNumber NID below.
+    #pragma warning disable SHEM004
+    [SysAbiExport(
+        Nid = "bwFjS+bX9mA",
+        ExportName = "sceUserServiceGetUserNumber",
+        Target = Generation.Gen5,
+        LibraryName = "libSceUserService")]
+    public static int UserServiceGetUserNumber(CpuContext ctx) => GetUserNumber(ctx);
+    #pragma warning restore SHEM004
+
+    // Canonical NID for sceUserServiceGetUserNumber.
+    [SysAbiExport(
+        Nid = "qbwy0Ub8b3M",
+        ExportName = "sceUserServiceGetUserNumber",
+        Target = Generation.Gen5,
+        LibraryName = "libSceUserService")]
+    public static int UserServiceGetUserNumberAlt(CpuContext ctx) => GetUserNumber(ctx);
 
     // Name not yet in ps5_names.txt and the NID was captured from titles; revisit when the symbol is catalogued.
     #pragma warning disable SHEM006
@@ -275,6 +307,25 @@ public static class UserServiceExports
         Span<byte> bytes = stackalloc byte[sizeof(int)];
         BinaryPrimitives.WriteInt32LittleEndian(bytes, value);
         return ctx.Memory.TryWrite(address, bytes);
+    }
+
+    private static int GetUserNumber(CpuContext ctx)
+    {
+        var userId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var numberAddress = ctx[CpuRegister.Rsi];
+        if (numberAddress == 0)
+        {
+            return SetReturn(ctx, OrbisUserServiceErrorInvalidArgument);
+        }
+
+        if (userId != PrimaryUserId)
+        {
+            return SetReturn(ctx, OrbisUserServiceErrorInvalidParameter);
+        }
+
+        return TryWriteInt32(ctx, numberAddress, 1)
+            ? SetReturnWithTrace(ctx, 0, $"get_user_number user={userId} value=1 out=0x{numberAddress:X16}")
+            : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
 
     private static int WriteUserSettingInt32(CpuContext ctx, int value, string operation)

@@ -11,6 +11,8 @@ namespace SharpEmu.Libs.SystemService;
 public static class SystemServiceExports
 {
     private const int OrbisSystemServiceErrorParameter = unchecked((int)0x80A10003);
+    private const int OrbisSystemServiceErrorNoEvent = unchecked((int)0x80A10004);
+    private const int SystemServiceEventSize = sizeof(int) + 8192;
     private const int SystemServiceStatusSize = 0x0C;
     private const int DisplaySafeAreaInfoSize = sizeof(float) + 128;
     private const int HdrToneMapLuminanceSize = sizeof(float) * 3;
@@ -44,6 +46,50 @@ public static class SystemServiceExports
             ? ctx.SetReturn(0)
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
+
+    [SysAbiExport(
+        Nid = "656LMQSrg6U",
+        ExportName = "sceSystemServiceReceiveEvent",
+        Target = Generation.Gen5,
+        LibraryName = "libSceSystemService")]
+    public static int SystemServiceReceiveEvent(CpuContext ctx)
+    {
+        var eventAddress = ctx[CpuRegister.Rdi];
+        if (eventAddress == 0)
+        {
+            return ctx.SetReturn(OrbisSystemServiceErrorParameter);
+        }
+
+        // The hosted system UI has no event queue. Match the PS5 ABI by
+        // initializing the complete event object before reporting no event.
+        Span<byte> systemEvent = stackalloc byte[SystemServiceEventSize];
+        systemEvent.Clear();
+        BinaryPrimitives.WriteInt32LittleEndian(systemEvent, -1);
+        return ctx.Memory.TryWrite(eventAddress, systemEvent)
+            ? ctx.SetReturn(OrbisSystemServiceErrorNoEvent)
+            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    [SysAbiExport(
+        Nid = "8Lo6Zv94aho",
+        ExportName = "sceSystemServiceDisableNoticeScreenSkipFlagAutoSet",
+        Target = Generation.Gen5,
+        LibraryName = "libSceSystemService")]
+    public static int SystemServiceDisableNoticeScreenSkipFlagAutoSet(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(
+        Nid = "Q3utJvma4Mo",
+        ExportName = "sceSystemServiceSetNoticeScreenSkipFlag",
+        Target = Generation.Gen5,
+        LibraryName = "libSceSystemService")]
+    public static int SystemServiceSetNoticeScreenSkipFlag(CpuContext ctx) => ctx.SetReturn(0);
+
+    [SysAbiExport(
+        Nid = "XbbJC3E+L5M",
+        ExportName = "sceSystemServicePowerTick",
+        Target = Generation.Gen5,
+        LibraryName = "libSceSystemService")]
+    public static int SystemServicePowerTick(CpuContext ctx) => ctx.SetReturn(0);
 
     [SysAbiExport(
         Nid = "4veE0XiIugA",

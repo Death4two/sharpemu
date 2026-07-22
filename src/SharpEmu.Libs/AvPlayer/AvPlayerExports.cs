@@ -59,6 +59,12 @@ public static class AvPlayerExports
         public ulong AudioBufferBase { get; set; }
         public int NextAudioBuffer { get; set; }
         public long NextAudioFrameIndex { get; set; }
+        public ulong StartTimeMilliseconds { get; set; }
+        public bool VideoStreamEnabled { get; set; } = true;
+        public bool AudioStreamEnabled { get; set; } = true;
+        public uint StartBandwidth { get; set; }
+        public uint MinimumBandwidth { get; set; }
+        public uint MaximumBandwidth { get; set; }
 
         public void Dispose()
         {
@@ -110,6 +116,7 @@ public static class AvPlayerExports
             PlaybackClock.Reset();
             NextFrameIndex = 0;
             NextAudioFrameIndex = 0;
+            StartTimeMilliseconds = 0;
             EndOfStream = false;
         }
     }
@@ -388,7 +395,39 @@ public static class AvPlayerExports
         ExportName = "sceAvPlayerEnableStream",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceAvPlayer")]
-    public static int AvPlayerEnableStream(CpuContext ctx) => ValidatePlayer(ctx);
+    public static int AvPlayerEnableStream(CpuContext ctx) =>
+        SetStreamEnabled(ctx, unchecked((uint)ctx[CpuRegister.Rsi]), enabled: true);
+
+    [SysAbiExport(
+        Nid = "BOVKAzRmuTQ",
+        ExportName = "sceAvPlayerDisableStream",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAvPlayer")]
+    public static int AvPlayerDisableStream(CpuContext ctx) =>
+        SetStreamEnabled(ctx, unchecked((uint)ctx[CpuRegister.Rsi]), enabled: false);
+
+    [SysAbiExport(
+        Nid = "buMCiJftcfw",
+        ExportName = "sceAvPlayerChangeStream",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAvPlayer")]
+    public static int AvPlayerChangeStream(CpuContext ctx)
+    {
+        var oldStream = unchecked((uint)ctx[CpuRegister.Rsi]);
+        var newStream = unchecked((uint)ctx[CpuRegister.Rdx]);
+        lock (StateGate)
+        {
+            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) ||
+                player.SourcePath is null || oldStream > 1 || newStream > 1)
+            {
+                return SetReturn(ctx, InvalidParameters);
+            }
+
+            SetStreamEnabled(player, oldStream, enabled: false);
+            SetStreamEnabled(player, newStream, enabled: true);
+            return SetReturn(ctx, 0);
+        }
+    }
 
     [SysAbiExport(
         Nid = "k-q+xOxdc3E",
@@ -418,15 +457,45 @@ public static class AvPlayerExports
     {
         lock (StateGate)
         {
-            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player))
+            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) ||
+                player.SourcePath is null)
             {
                 return SetReturn(ctx, InvalidParameters);
             }
 
-            player.ResetPlayback();
-            player.Started = true;
+            RestartAt(player, ctx[CpuRegister.Rsi]);
             return SetReturn(ctx, 0);
         }
+    }
+
+    [SysAbiExport(
+        Nid = "NxSdL9t-KXk",
+        ExportName = "sceAvPlayerStartEx",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAvPlayer")]
+    public static int AvPlayerStartEx(CpuContext ctx)
+    {
+        PlayerState player;
+        lock (StateGate)
+        {
+            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out player!) ||
+                player.SourcePath is null)
+            {
+                return SetReturn(ctx, InvalidParameters);
+            }
+
+            var startInfo = ctx[CpuRegister.Rsi];
+            var startTime = 0UL;
+            if (startInfo != 0 && !ctx.TryReadUInt64(startInfo, out startTime))
+            {
+                return SetReturn(ctx, InvalidParameters);
+            }
+
+            RestartAt(player, startTime);
+        }
+
+        NotifyEvent(ctx, player, 3); // StatePlay
+        return SetReturn(ctx, 0);
     }
 
     [SysAbiExport(
@@ -478,7 +547,7 @@ public static class AvPlayerExports
         {
             if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) ||
                 infoAddress == 0 || !player.Started || player.Paused || player.EndOfStream ||
-                player.SourcePath is null || !EnsureAudioDecoder(player))
+                !player.AudioStreamEnabled || player.SourcePath is null || !EnsureAudioDecoder(player))
             {
                 return SetReturn(ctx, 0);
             }
@@ -513,7 +582,8 @@ public static class AvPlayerExports
                 return SetReturn(ctx, 0);
             }
 
-            var timestamp = checked((ulong)(player.NextAudioFrameIndex * samplesPerFrame * 1000L / sampleRate));
+            var timestamp = checked(player.StartTimeMilliseconds +
+                (ulong)(player.NextAudioFrameIndex * samplesPerFrame * 1000L / sampleRate));
             player.NextAudioFrameIndex++;
             Span<byte> info = stackalloc byte[FrameInfoSize];
             info.Clear();
@@ -605,6 +675,33 @@ public static class AvPlayerExports
     public static int AvPlayerGetStreamInfo(CpuContext ctx) =>
         GetStreamInfoCore(ctx, StreamInfoSize);
 
+    private static int SetStreamEnabled(CpuContext ctx, uint streamIndex, bool enabled)
+    {
+        lock (StateGate)
+        {
+            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) ||
+                player.SourcePath is null || streamIndex > 1)
+            {
+                return SetReturn(ctx, InvalidParameters);
+            }
+
+            SetStreamEnabled(player, streamIndex, enabled);
+            return SetReturn(ctx, 0);
+        }
+    }
+
+    private static void SetStreamEnabled(PlayerState player, uint streamIndex, bool enabled)
+    {
+        if (streamIndex == 0)
+        {
+            player.VideoStreamEnabled = enabled;
+        }
+        else
+        {
+            player.AudioStreamEnabled = enabled;
+        }
+    }
+
     private static int GetStreamInfoCore(CpuContext ctx, int infoSize)
     {
         var streamIndex = unchecked((uint)ctx[CpuRegister.Rsi]);
@@ -687,7 +784,7 @@ public static class AvPlayerExports
         {
             if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) ||
                 infoAddress == 0 || !player.Started || player.Paused || player.EndOfStream ||
-                player.SourcePath is null)
+                !player.VideoStreamEnabled || player.SourcePath is null)
             {
                 return SetReturn(ctx, 0);
             }
@@ -714,7 +811,8 @@ public static class AvPlayerExports
                 return FinishStream(ctx, player);
             }
 
-            var timestamp = checked((ulong)Math.Round(player.NextFrameIndex * 1000.0 / fps));
+            var timestamp = checked(player.StartTimeMilliseconds +
+                (ulong)Math.Round(player.NextFrameIndex * 1000.0 / fps));
             player.NextFrameIndex++;
             if (!WriteVideoFrame(ctx, player, infoAddress, timestamp, extended))
             {
@@ -739,6 +837,26 @@ public static class AvPlayerExports
             player.PlaybackClock.Stop();
         }
         return SetReturn(ctx, 0);
+    }
+
+    private static void RestartAt(PlayerState player, ulong startTimeMilliseconds)
+    {
+        player.ResetPlayback();
+        player.StartTimeMilliseconds = startTimeMilliseconds;
+        player.Started = true;
+        player.Paused = false;
+    }
+
+    private static void AddSeekArguments(ProcessStartInfo startInfo, ulong startTimeMilliseconds)
+    {
+        if (startTimeMilliseconds == 0)
+        {
+            return;
+        }
+
+        startInfo.ArgumentList.Add("-ss");
+        startInfo.ArgumentList.Add(
+            (startTimeMilliseconds / 1000.0).ToString("0.###", CultureInfo.InvariantCulture));
     }
 
     private static bool EnsureDecoder(PlayerState player)
@@ -766,6 +884,7 @@ public static class AvPlayerExports
         startInfo.ArgumentList.Add("-hide_banner");
         startInfo.ArgumentList.Add("-loglevel");
         startInfo.ArgumentList.Add("error");
+        AddSeekArguments(startInfo, player.StartTimeMilliseconds);
         startInfo.ArgumentList.Add("-i");
         startInfo.ArgumentList.Add(player.SourcePath);
         startInfo.ArgumentList.Add("-map");
@@ -830,6 +949,7 @@ public static class AvPlayerExports
         startInfo.ArgumentList.Add("-hide_banner");
         startInfo.ArgumentList.Add("-loglevel");
         startInfo.ArgumentList.Add("error");
+        AddSeekArguments(startInfo, player.StartTimeMilliseconds);
         startInfo.ArgumentList.Add("-i");
         startInfo.ArgumentList.Add(player.SourcePath);
         startInfo.ArgumentList.Add("-map");

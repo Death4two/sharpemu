@@ -11,12 +11,18 @@ public sealed class VideoOutOutputSupportTests
     private const string OpenNid = "Up36PTk687E";
     private const string CloseNid = "uquVH4-Du78";
     private const string OutputSupportNid = "Nv8c-Kb+DUM";
+    private const string ConfigureOutputNid = "w0hLuNarQxY";
+    private const string LatencyWaitNid = "eb-gvTYQcoY";
+    private const string LatencyStartPointNid = "MCJ8SkzsQxY";
+    private const string AddPreVblankNid = "keipklF0pMY";
+    private const string DeletePreVblankNid = "elWQ9vERF-Q";
     private const ulong MemoryBase = 0x1_0000_0000;
     private const ulong OptionsAddress = MemoryBase + 0x100;
     private static readonly ulong InvalidValue = unchecked((ulong)(int)0x80290001);
     private static readonly ulong InvalidHandle = unchecked((ulong)(int)0x8029000B);
     private static readonly ulong UnsupportedOutputMode = unchecked((ulong)(int)0x80290016);
     private static readonly ulong InvalidOption = unchecked((ulong)(int)0x8029001A);
+    private static readonly ulong UnavailableOutputMode = unchecked((ulong)(int)0x80290019);
     private static readonly ulong MemoryFault =
         unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
 
@@ -73,6 +79,40 @@ public sealed class VideoOutOutputSupportTests
             Assert.Equal(
                 UnsupportedOutputMode,
                 DispatchOutputSupport(manager, context, handle, 2));
+
+            // Kyty validates ConfigureOutput through IsOutputSupported: a
+            // syntactically valid 119.88Hz request is unavailable on a 60Hz
+            // output rather than silently succeeding.
+            context[CpuRegister.Rdi] = handle;
+            context[CpuRegister.Rsi] = 15;
+            context[CpuRegister.Rdx] = 0;
+            context[CpuRegister.Rcx] = 0;
+            context[CpuRegister.R8] = 0;
+            Assert.True(manager.TryDispatch(ConfigureOutputNid, context, out _));
+            Assert.Equal(UnavailableOutputMode, context[CpuRegister.Rax]);
+
+            context[CpuRegister.Rsi] = 1;
+            Assert.True(manager.TryDispatch(ConfigureOutputNid, context, out _));
+            Assert.Equal(0UL, context[CpuRegister.Rax]);
+
+            context[CpuRegister.Rdi] = handle;
+            Assert.True(manager.TryDispatch(LatencyWaitNid, context, out _));
+            Assert.Equal(0UL, context[CpuRegister.Rax]);
+            context[CpuRegister.Rsi] = 0xDEAD_BEEF;
+            Assert.True(manager.TryDispatch(LatencyStartPointNid, context, out _));
+            Assert.Equal(0UL, context[CpuRegister.Rax]);
+
+            context[CpuRegister.Rdi] = ulong.MaxValue;
+            Assert.True(manager.TryDispatch(LatencyWaitNid, context, out _));
+            Assert.Equal(InvalidHandle, context[CpuRegister.Rax]);
+
+            context[CpuRegister.Rdi] = 0;
+            context[CpuRegister.Rsi] = handle;
+            context[CpuRegister.Rdx] = 0;
+            Assert.True(manager.TryDispatch(AddPreVblankNid, context, out _));
+            Assert.Equal(unchecked((ulong)(int)0x8029000C), context[CpuRegister.Rax]);
+            Assert.True(manager.TryDispatch(DeletePreVblankNid, context, out _));
+            Assert.Equal(0UL, context[CpuRegister.Rax]);
         }
         finally
         {

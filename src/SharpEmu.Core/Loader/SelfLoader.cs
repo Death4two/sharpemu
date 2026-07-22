@@ -75,7 +75,10 @@ public sealed class SelfLoader : ISelfLoader
     private const uint RelocationTypeRelative64 = 38;
     private const ulong Ps5MainImageBase = 0x0000000800000000UL;
     private const ulong Ps4MainImageBase = 0x0000000000400000UL;
-    private const ulong Ps5ModuleSearchStart = 0x0000000804000000UL;
+    // Keep dynamically loaded modules outside the 256 MiB fixed main-image
+    // reservation.  The previous 64 MiB boundary overlapped large retail
+    // executables such as PPSA03524.
+    private const ulong Ps5ModuleSearchStart = 0x0000000810000000UL;
     private const ulong Ps5ModuleSearchEnd = 0x0000000900000000UL;
     private const ulong Ps4ModuleSearchStart = 0x0000000002000000UL;
     private const ulong Ps4ModuleSearchEnd = 0x0000000040000000UL;
@@ -169,7 +172,14 @@ public sealed class SelfLoader : ISelfLoader
 
         if (clearVirtualMemory)
         {
-            virtualMemory.Clear();
+            if (virtualMemory is PhysicalVirtualMemory preallocatedVm)
+            {
+                preallocatedVm.Clear(preservePersistentReservations: true);
+            }
+            else
+            {
+                virtualMemory.Clear();
+            }
             _nextTlsModuleId = 1;
             GuestTlsTemplate.Reset();
         }
@@ -197,7 +207,15 @@ public sealed class SelfLoader : ISelfLoader
         {
             if (clearVirtualMemory)
             {
-                if (!physicalVm.TryAllocateAtExact(imageBase, totalImageSize, executable: true, out var allocatedBase))
+                ulong allocatedBase;
+                if (physicalVm.HasPersistentReservationCovering(imageBase, totalImageSize))
+                {
+                    // The runtime claimed this fixed image window before CLR
+                    // initialization. MapLoadSegments commits only the ELF
+                    // pages it needs, retaining the original guest base.
+                    allocatedBase = imageBase;
+                }
+                else if (!physicalVm.TryAllocateAtExact(imageBase, totalImageSize, executable: true, out allocatedBase))
                 {
                     // Exact allocation failed — the host may have already claimed
                     // part of this range (ASLR, Rosetta 2, or another process).
@@ -220,7 +238,8 @@ public sealed class SelfLoader : ISelfLoader
                             $"(size=0x{totalImageSize:X}): {reason}. " +
                             "Try closing other applications, rebooting, or " +
                             (OperatingSystem.IsWindows()
-                                ? "setting SHARPEMU_DISABLE_MITIGATION_RELAUNCH=1."
+                                ? "launching the current SharpEmu build without " +
+                                  "SHARPEMU_DISABLE_MITIGATION_RELAUNCH."
                                 : "ensuring no other process maps into this address range."));
                     }
 

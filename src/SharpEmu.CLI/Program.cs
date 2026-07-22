@@ -3,6 +3,7 @@
 
 using SharpEmu.Core.Runtime;
 using SharpEmu.Core.Cpu;
+using SharpEmu.Core.Memory;
 using SharpEmu.GUI;
 using SharpEmu.HLE;
 using SharpEmu.Libs.VideoOut;
@@ -15,13 +16,25 @@ namespace SharpEmu.CLI;
 
 internal static partial class Program
 {
-    private static readonly SharpEmuLogger Log = SharpEmuLog.For("SharpEmu.CLI");
+    private static SharpEmuLogger Log => SharpEmuLog.For("SharpEmu.CLI");
     private static readonly object ConsoleMirrorSync = new();
     private static StreamWriter? _consoleMirrorFile;
     private const int DefaultImportTraceLimit = 32;
     private const string MitigatedChildFlag = "--sharpemu-mitigated-child";
     private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+    private const uint CREATE_SUSPENDED = 0x00000004;
     private const uint INFINITE = 0xFFFFFFFF;
+    private const uint MEM_RESERVE = 0x00002000;
+    private const uint PAGE_NOACCESS = 0x01;
+    private const ulong Ps5MainImageBase = 0x0000000800000000UL;
+    // Some retail executables (for example PPSA03524) exceed 64 MiB. Keep the
+    // complete fixed image window reserved before CoreCLR starts.
+    private const ulong Ps5MainImageWindowSize = 0x10000000UL;
+    // Unity's PS5 application heap grows here in fixed 1 MiB TLSF pools.
+    // Reserve it before CoreCLR begins so fixed sceKernelMprotect requests do
+    // not collide with a broad CLR reservation.
+    private const ulong Ps5ApplicationHeapBase = 0x0000000600000000UL;
+    private const ulong Ps5ApplicationHeapSize = 0x0000000100000000UL;
     private const int PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY = 0x00020007;
     private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
     private const int JobObjectExtendedLimitInformation = 9;
@@ -29,6 +42,13 @@ internal static partial class Program
     private const uint HANDLE_FLAG_INHERIT = 0x00000001;
     private const string MitigatedChildEnvironment = "SHARPEMU_MITIGATED_CHILD";
     private const ulong PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_OFF = 0x00000002UL << 40;
+    // The CLR can reserve a multi-hundred-GiB high-entropy region beginning
+    // below the PS5 main-image base. Keep the guest's fixed 0x800000000 image
+    // window available in the child instead of relocating the guest image.
+    private const ulong PROCESS_CREATION_MITIGATION_POLICY_FORCE_RELOCATE_IMAGES_ALWAYS_OFF = 0x00000002UL << 8;
+    private const ulong PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_OFF = 0x00000002UL << 16;
+    // HIGH_ENTROPY_ASLR occupies bits 20-21 (bits 24-25 are an extension point).
+    private const ulong PROCESS_CREATION_MITIGATION_POLICY_HIGH_ENTROPY_ASLR_ALWAYS_OFF = 0x00000002UL << 20;
     private const ulong PROCESS_CREATION_MITIGATION_POLICY2_CET_USER_SHADOW_STACKS_ALWAYS_OFF = 0x00000002UL << 28;
     private const ulong PROCESS_CREATION_MITIGATION_POLICY2_USER_CET_SET_CONTEXT_IP_VALIDATION_ALWAYS_OFF = 0x00000002UL << 32;
     private const ulong PROCESS_CREATION_MITIGATION_POLICY2_XTENDED_CONTROL_FLOW_GUARD_ALWAYS_OFF = 0x00000002UL << 40;
@@ -45,6 +65,14 @@ internal static partial class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        // Reserve before console/logging/runtime initialization. Those paths
+        // can first-JIT managed code which may otherwise reserve across the
+        // PS5 fixed main-image base on Windows.
+        if (OperatingSystem.IsWindows())
+        {
+            _ = PhysicalVirtualMemory.TryReservePs5MainImageWindowEarly();
+        }
+
         try
         {
             return Run(args);
@@ -580,7 +608,11 @@ internal static partial class Program
 
             startupInfoEx.lpAttributeList = attributeList;
 
-            var policy1 = PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_OFF;
+            var policy1 =
+                PROCESS_CREATION_MITIGATION_POLICY_CONTROL_FLOW_GUARD_ALWAYS_OFF |
+                PROCESS_CREATION_MITIGATION_POLICY_FORCE_RELOCATE_IMAGES_ALWAYS_OFF |
+                PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_OFF |
+                PROCESS_CREATION_MITIGATION_POLICY_HIGH_ENTROPY_ASLR_ALWAYS_OFF;
             var policy2 =
                 PROCESS_CREATION_MITIGATION_POLICY2_CET_USER_SHADOW_STACKS_ALWAYS_OFF |
                 PROCESS_CREATION_MITIGATION_POLICY2_USER_CET_SET_CONTEXT_IP_VALIDATION_ALWAYS_OFF;
@@ -612,7 +644,7 @@ internal static partial class Program
                 0,
                 0,
                 true,
-                EXTENDED_STARTUPINFO_PRESENT,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
                 0,
                 Environment.CurrentDirectory,
                 ref startupInfoEx,
@@ -627,6 +659,50 @@ internal static partial class Program
 
             try
             {
+                // CoreCLR reserves address space before any managed child code
+                // runs. Claim the fixed PS5 image window while the child is
+                // suspended, then let its VM adopt this exact reservation.
+                var fixedWindow = VirtualAllocEx(
+                    processInfo.hProcess,
+                    unchecked((nint)Ps5MainImageBase),
+                    (nuint)Ps5MainImageWindowSize,
+                    MEM_RESERVE,
+                    PAGE_NOACCESS);
+                if ((ulong)fixedWindow != Ps5MainImageBase)
+                {
+                    childExitCode = 5;
+                    Console.Error.WriteLine(
+                        $"[ERROR] Failed to reserve the fixed PS5 image window in the child: " +
+                        $"Win32={Marshal.GetLastWin32Error()}");
+                    _ = TerminateProcess(processInfo.hProcess, 1);
+                    return true;
+                }
+
+                var applicationHeapWindow = VirtualAllocEx(
+                    processInfo.hProcess,
+                    unchecked((nint)Ps5ApplicationHeapBase),
+                    unchecked((nuint)Ps5ApplicationHeapSize),
+                    MEM_RESERVE,
+                    PAGE_NOACCESS);
+                if ((ulong)applicationHeapWindow != Ps5ApplicationHeapBase)
+                {
+                    childExitCode = 5;
+                    Console.Error.WriteLine(
+                        $"[ERROR] Failed to reserve the fixed PS5 application-heap window in the child: " +
+                        $"Win32={Marshal.GetLastWin32Error()}");
+                    _ = TerminateProcess(processInfo.hProcess, 1);
+                    return true;
+                }
+
+                if (ResumeThread(processInfo.hThread) == uint.MaxValue)
+                {
+                    childExitCode = 5;
+                    Console.Error.WriteLine(
+                        $"[ERROR] Failed to resume mitigated child process: {Marshal.GetLastWin32Error()}");
+                    _ = TerminateProcess(processInfo.hProcess, 1);
+                    return true;
+                }
+
                 jobHandle = CreateJobObjectW(0, null);
                 if (jobHandle != 0 &&
                     TryEnableKillOnJobClose(jobHandle) &&
@@ -1443,6 +1519,17 @@ internal static partial class Program
         string currentDirectory,
         ref STARTUPINFOEX startupInfo,
         out PROCESS_INFORMATION processInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern nint VirtualAllocEx(
+        nint process,
+        nint address,
+        nuint size,
+        uint allocationType,
+        uint protection);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint ResumeThread(nint thread);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern uint WaitForSingleObject(nint handle, uint milliseconds);

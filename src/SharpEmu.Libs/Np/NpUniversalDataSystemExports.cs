@@ -11,6 +11,7 @@ public static class NpUniversalDataSystemExports
     private const int NpUniversalDataSystemErrorInvalidArgument = unchecked((int)0x80553102);
     private static readonly object _eventGate = new();
     private static readonly HashSet<int> _createdEvents = [];
+    private static readonly Dictionary<ulong, IGuestMemoryAllocator> _eventPropertyObjects = [];
     private static int _nextHandle = 1;
     private static int _nextEvent = 1;
 
@@ -119,6 +120,73 @@ public static class NpUniversalDataSystemExports
         return ctx.SetReturn(0, typeof(long));
     }
 
+    // Kyty implements these as opaque host objects.  The guest ABI exposes a
+    // pointer, so allocate a small zeroed guest object instead and retain its
+    // allocator for lifetime validation/freeing.  The object contents are
+    // deliberately private to the HLE; property setters consume it only as an
+    // opaque identity.
+    [SysAbiExport(
+        Nid = "s6W4Zl4Slgk",
+        ExportName = "sceNpUniversalDataSystemCreateEventPropertyObject",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpUniversalDataSystem")]
+    public static int NpUniversalDataSystemCreateEventPropertyObject(CpuContext ctx)
+    {
+        var outputAddress = ctx[CpuRegister.Rdi];
+        if (outputAddress == 0)
+        {
+            return ctx.SetReturn(NpUniversalDataSystemErrorInvalidArgument, typeof(long));
+        }
+
+        if (ctx.Memory is not IGuestMemoryAllocator allocator ||
+            !allocator.TryAllocateGuestMemory(0x10, 0x10, out var objectAddress))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT, typeof(long));
+        }
+
+        Span<byte> emptyObject = stackalloc byte[0x10];
+        emptyObject.Clear();
+        if (!ctx.Memory.TryWrite(objectAddress, emptyObject) ||
+            !ctx.TryWriteUInt64(outputAddress, objectAddress))
+        {
+            _ = allocator.TryFreeGuestMemory(objectAddress);
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT, typeof(long));
+        }
+
+        lock (_eventGate)
+        {
+            _eventPropertyObjects[objectAddress] = allocator;
+        }
+
+        return ctx.SetReturn(0, typeof(long));
+    }
+
+    [SysAbiExport(
+        Nid = "kKUH0Viib3c",
+        ExportName = "sceNpUniversalDataSystemDestroyEventPropertyObject",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpUniversalDataSystem")]
+    public static int NpUniversalDataSystemDestroyEventPropertyObject(CpuContext ctx)
+    {
+        var objectAddress = ctx[CpuRegister.Rdi];
+        if (objectAddress == 0)
+        {
+            return ctx.SetReturn(NpUniversalDataSystemErrorInvalidArgument, typeof(long));
+        }
+
+        IGuestMemoryAllocator? allocator;
+        lock (_eventGate)
+        {
+            if (!_eventPropertyObjects.Remove(objectAddress, out allocator))
+            {
+                return ctx.SetReturn(NpUniversalDataSystemErrorInvalidArgument, typeof(long));
+            }
+        }
+
+        _ = allocator.TryFreeGuestMemory(objectAddress);
+        return ctx.SetReturn(0, typeof(long));
+    }
+
     [SysAbiExport(
         Nid = "MfDb+4Nln64",
         ExportName = "sceNpUniversalDataSystemEventPropertyObjectSetString",
@@ -126,18 +194,112 @@ public static class NpUniversalDataSystemExports
         LibraryName = "libSceNpUniversalDataSystem")]
     public static int NpUniversalDataSystemEventPropertyObjectSetString(CpuContext ctx)
     {
-        var propertyObjectAddress = ctx[CpuRegister.Rsi];
+        var propertyObjectAddress = ctx[CpuRegister.Rdi];
+        var keyAddress = ctx[CpuRegister.Rsi];
         var valueAddress = ctx[CpuRegister.Rdx];
-        if (propertyObjectAddress == 0 || valueAddress == 0)
+        if (!IsEventPropertyObject(propertyObjectAddress) || keyAddress == 0 || valueAddress == 0)
         {
             return ctx.SetReturn(NpUniversalDataSystemErrorInvalidArgument, typeof(long));
         }
 
         Span<byte> probe = stackalloc byte[1];
-        return ctx.Memory.TryRead(propertyObjectAddress, probe) &&
+        return ctx.Memory.TryRead(keyAddress, probe) &&
                ctx.Memory.TryRead(valueAddress, probe)
             ? ctx.SetReturn(0, typeof(long))
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT, typeof(long));
+    }
+
+    // The typed setters share the (object, UTF-8 key, scalar value) ABI. The
+    // scalar lives entirely in registers, so only the opaque object identity
+    // and key pointer need guest-memory validation.
+    [SysAbiExport(
+        Nid = "YE4dbtbz6OE",
+        ExportName = "sceNpUniversalDataSystemEventPropertyObjectSetInt32",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpUniversalDataSystem")]
+    public static int NpUniversalDataSystemEventPropertyObjectSetInt32(CpuContext ctx) =>
+        SetEventPropertyObjectKeyValue(ctx);
+
+    [SysAbiExport(
+        Nid = "AzD4irAcKE4",
+        ExportName = "sceNpUniversalDataSystemEventPropertyObjectSetUInt32",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpUniversalDataSystem")]
+    public static int NpUniversalDataSystemEventPropertyObjectSetUInt32(CpuContext ctx) =>
+        SetEventPropertyObjectKeyValue(ctx);
+
+    [SysAbiExport(
+        Nid = "56QLTqx911s",
+        ExportName = "sceNpUniversalDataSystemEventPropertyObjectSetInt64",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpUniversalDataSystem")]
+    public static int NpUniversalDataSystemEventPropertyObjectSetInt64(CpuContext ctx) =>
+        SetEventPropertyObjectKeyValue(ctx);
+
+    [SysAbiExport(
+        Nid = "xvsP5Yz6FmY",
+        ExportName = "sceNpUniversalDataSystemEventPropertyObjectSetUInt64",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpUniversalDataSystem")]
+    public static int NpUniversalDataSystemEventPropertyObjectSetUInt64(CpuContext ctx) =>
+        SetEventPropertyObjectKeyValue(ctx);
+
+    [SysAbiExport(
+        Nid = "lbPlT4+QVcE",
+        ExportName = "sceNpUniversalDataSystemEventPropertyObjectSetFloat32",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpUniversalDataSystem")]
+    public static int NpUniversalDataSystemEventPropertyObjectSetFloat32(CpuContext ctx) =>
+        SetEventPropertyObjectKeyValue(ctx);
+
+    [SysAbiExport(
+        Nid = "4Fu8tHW+u-k",
+        ExportName = "sceNpUniversalDataSystemEventPropertyObjectSetFloat64",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpUniversalDataSystem")]
+    public static int NpUniversalDataSystemEventPropertyObjectSetFloat64(CpuContext ctx) =>
+        SetEventPropertyObjectKeyValue(ctx);
+
+    [SysAbiExport(
+        Nid = "Fidd8vWgyVE",
+        ExportName = "sceNpUniversalDataSystemEventPropertyObjectSetBool",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpUniversalDataSystem")]
+    public static int NpUniversalDataSystemEventPropertyObjectSetBool(CpuContext ctx) =>
+        SetEventPropertyObjectKeyValue(ctx);
+
+    [SysAbiExport(
+        Nid = "wAcxBDLHj1M",
+        ExportName = "sceNpUniversalDataSystemEventPropertyObjectSetBinary",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpUniversalDataSystem")]
+    public static int NpUniversalDataSystemEventPropertyObjectSetBinary(CpuContext ctx)
+    {
+        var propertyObjectAddress = ctx[CpuRegister.Rdi];
+        var keyAddress = ctx[CpuRegister.Rsi];
+        var valueAddress = ctx[CpuRegister.Rdx];
+        var valueSize = ctx[CpuRegister.Rcx];
+        if (!IsEventPropertyObject(propertyObjectAddress) || keyAddress == 0 ||
+            (valueAddress == 0 && valueSize != 0))
+        {
+            return ctx.SetReturn(NpUniversalDataSystemErrorInvalidArgument, typeof(long));
+        }
+
+        if (valueSize != 0 && valueAddress > ulong.MaxValue - (valueSize - 1))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT, typeof(long));
+        }
+
+        Span<byte> probe = stackalloc byte[1];
+        if (!ctx.Memory.TryRead(keyAddress, probe) ||
+            (valueSize != 0 &&
+             (!ctx.Memory.TryRead(valueAddress, probe) ||
+              !ctx.Memory.TryRead(valueAddress + valueSize - 1, probe))))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT, typeof(long));
+        }
+
+        return ctx.SetReturn(0, typeof(long));
     }
 
     [SysAbiExport(
@@ -147,15 +309,16 @@ public static class NpUniversalDataSystemExports
         LibraryName = "libSceNpUniversalDataSystem")]
     public static int NpUniversalDataSystemEventPropertyObjectSetArray(CpuContext ctx)
     {
-        var propertyObjectAddress = ctx[CpuRegister.Rsi];
+        var propertyObjectAddress = ctx[CpuRegister.Rdi];
+        var keyAddress = ctx[CpuRegister.Rsi];
         var valueAddress = ctx[CpuRegister.Rdx];
-        if (propertyObjectAddress == 0)
+        if (!IsEventPropertyObject(propertyObjectAddress) || keyAddress == 0)
         {
             return ctx.SetReturn(NpUniversalDataSystemErrorInvalidArgument, typeof(long));
         }
 
         Span<byte> probe = stackalloc byte[1];
-        if (!ctx.Memory.TryRead(propertyObjectAddress, probe))
+        if (!ctx.Memory.TryRead(keyAddress, probe))
         {
             return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT, typeof(long));
         }
@@ -208,5 +371,28 @@ public static class NpUniversalDataSystemExports
     public static int NpUniversalDataSystemEventPropertyArraySetString(CpuContext ctx)
     {
         return ctx.SetReturn(0, typeof(long));
+    }
+
+    private static bool IsEventPropertyObject(ulong address)
+    {
+        lock (_eventGate)
+        {
+            return _eventPropertyObjects.ContainsKey(address);
+        }
+    }
+
+    private static int SetEventPropertyObjectKeyValue(CpuContext ctx)
+    {
+        var propertyObjectAddress = ctx[CpuRegister.Rdi];
+        var keyAddress = ctx[CpuRegister.Rsi];
+        if (!IsEventPropertyObject(propertyObjectAddress) || keyAddress == 0)
+        {
+            return ctx.SetReturn(NpUniversalDataSystemErrorInvalidArgument, typeof(long));
+        }
+
+        Span<byte> probe = stackalloc byte[1];
+        return ctx.Memory.TryRead(keyAddress, probe)
+            ? ctx.SetReturn(0, typeof(long))
+            : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT, typeof(long));
     }
 }

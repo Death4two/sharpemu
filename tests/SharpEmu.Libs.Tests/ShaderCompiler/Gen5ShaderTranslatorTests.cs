@@ -49,4 +49,34 @@ public sealed class Gen5ShaderTranslatorTests
         Assert.Equal(Gen5OperandKind.ScalarRegister, instruction.Sources[1].Kind);
         Assert.Equal(2u, instruction.Sources[1].Value);
     }
+
+    [Fact]
+    public void LshlrevB32SdwaAcceptsWordSelectedShiftCount()
+    {
+        // V_LSHLREV_B32 v3, v1, v2 with SDWA WORD_0 selectors on both
+        // sources. Kyty accepts a 16-bit source1 shift count; rejecting it
+        // makes otherwise valid PS5 shaders fail decoding before either host
+        // backend sees the documented zero/sign extension.
+        const uint instructionWord = 0x3406_04F9;
+        const uint sdwaWord = 0x8282_0001;
+        var memory = new FakeCpuMemory(ProgramAddress, 0x100);
+        Span<byte> code = stackalloc byte[3 * sizeof(uint)];
+        BinaryPrimitives.WriteUInt32LittleEndian(code, instructionWord);
+        BinaryPrimitives.WriteUInt32LittleEndian(code[sizeof(uint)..], sdwaWord);
+        BinaryPrimitives.WriteUInt32LittleEndian(code[(2 * sizeof(uint))..], 0xBF810000u);
+        Assert.True(memory.TryWrite(ProgramAddress, code));
+
+        var context = new CpuContext(memory, Generation.Gen5);
+        Assert.True(Gen5ShaderTranslator.TryDecodeProgram(
+            context, ProgramAddress, out var program, out var error), error);
+
+        var instruction = Assert.Single(
+            program.Instructions,
+            static item => item.Opcode == "VLshlrevB32");
+        var sdwa = Assert.IsType<Gen5SdwaControl>(instruction.Control);
+        Assert.Equal(2u, sdwa.Source0Select);
+        Assert.Equal(2u, sdwa.Source1Select);
+        Assert.Equal(1u, instruction.Sources[0].Value);
+        Assert.Equal(2u, instruction.Sources[1].Value);
+    }
 }

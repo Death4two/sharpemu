@@ -225,18 +225,30 @@ public sealed partial class DirectExecutionBackend
 				$"saved_rbp=0x{frameValue:X16} saved_ret=0x{frameReturn:X16}");
 		}
 		var isGuestWorker = GuestThreadExecution.IsGuestThread;
-		if (!IsLikelyReturnAddress(num7))
+		// Kyty's _sceKernelRtldSetApplicationHeapAPI path is a framed tail
+		// wrapper in the PS5 libc startup sequence. Do not apply that ABI repair
+		// to arbitrary imports merely because a stack word is not executable:
+		// several normal imports intentionally carry non-return stack data there.
+		if (!IsLikelyReturnAddress(num7) &&
+			string.Equals(importStubEntry.Nid, "p5EcQeEeJAE", StringComparison.Ordinal))
 		{
-			for (int i = 1; i <= 4; i++)
+			// A few PS5 runtime wrappers tail-jump through an import after
+			// retaining their frame.  In that form [rsp] is not a return slot;
+			// the caller's return lives at [rbp + 8].  Prefer that structural
+			// recovery over scanning arbitrary stack words: allocator callback
+			// tables also contain executable guest addresses and a scan can jump
+			// into one of those callbacks as if it were the import continuation.
+			if (TryGetImportCallerReturn(value4, importStackPointer, out var callerReturn))
 			{
-				ulong num8 = *(ulong*)(argPackPtr + 96 + i * 8);
-				if (IsLikelyReturnAddress(num8))
-				{
-					*(ulong*)(argPackPtr + 96) = num8;
-					num7 = num8;
-					Console.Error.WriteLine($"[LOADER][WARNING] Import#{num}: corrected suspicious return RIP using stack slot +0x{i * 8:X} -> 0x{num7:X16}");
-					break;
-				}
+				// Returning directly from the trampoline with its original RSP
+				// would retain the tail caller's local frame and corrupt the next
+				// return. Resume through a tiny guest `leave; ret` equivalent so
+				// RSP/RBP agree with the caller's ABI frame.
+				*(ulong*)(argPackPtr + 96) = unchecked((ulong)_tailCallFrameUnwindStub);
+				num7 = unchecked((ulong)_tailCallFrameUnwindStub);
+				Console.Error.WriteLine(
+					$"[LOADER][WARNING] Import#{num} ({importStubEntry.Nid}): unwinding tail-call frame " +
+					$"to caller return RIP 0x{callerReturn:X16}");
 			}
 		}
 		// Diagnostic compatibility escape hatch for a guest stack-protector
@@ -1388,6 +1400,36 @@ public sealed partial class DirectExecutionBackend
 			Volatile.Write(ref completedGuestThreadState.LastImportRax, result);
 			Volatile.Write(ref completedGuestThreadState.LastImportResultValid, 1);
 		}
+		return true;
+	}
+
+	private static bool TryGetImportCallerReturn(
+		ulong framePointer,
+		ulong importStackPointer,
+		out ulong callerReturn)
+	{
+		callerReturn = 0;
+		const ulong MaximumFrameDistance = 0x10000;
+		if (framePointer < importStackPointer ||
+			framePointer - importStackPointer > MaximumFrameDistance ||
+			!TryReadStackU64(framePointer, out var nextFrame) ||
+			!TryReadStackU64(framePointer + sizeof(ulong), out callerReturn) ||
+			!IsLikelyReturnAddress(callerReturn))
+		{
+			callerReturn = 0;
+			return false;
+		}
+
+		// A conventional nonterminal frame either points upward to its caller
+		// or terminates at zero. Reject unrelated data that merely happens to
+		// look like an executable address.
+		if (nextFrame != 0 &&
+			(nextFrame <= framePointer || nextFrame - framePointer > MaximumFrameDistance))
+		{
+			callerReturn = 0;
+			return false;
+		}
+
 		return true;
 	}
 

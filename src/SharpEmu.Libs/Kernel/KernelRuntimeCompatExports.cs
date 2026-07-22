@@ -17,6 +17,20 @@ namespace SharpEmu.Libs.Kernel;
 
 public static class KernelRuntimeCompatExports
 {
+    // libc asks this predicate while walking guest stack frames. SharpEmu
+    // installs host-side fault handling but never synthesizes a guest libc
+    // signal-return trampoline, therefore no guest return PC can match one.
+    [SysAbiExport(
+        Nid = "crb5j7mkk1c",
+        ExportName = "_is_signal_return",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int LibcIsSignalReturn(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     private const ulong TlsErrnoOffset = 0x40;
     private const ulong TlsStackChkGuardBaseOffset = 0x800;
     private const ulong StackChkGuardFieldOffset = 0x10;
@@ -57,6 +71,11 @@ public static class KernelRuntimeCompatExports
             ? unchecked((nint)stackChkGuardAddress)
             : AllocateStackChkGuardObject();
     private static ulong _applicationHeapApiAddress;
+    // libkernel receives a ten-pointer application allocator vtable from
+    // libc.  Keep its guest addresses for loader-owned allocation helpers;
+    // the table itself remains guest code and must never be invoked directly
+    // from managed code.
+    private static readonly ulong[] _applicationHeapApi = new ulong[10];
     private static ulong _processProcParamAddress;
     private static ulong _nextReservedVirtualBase = 0x6000_0000_0UL;
     private static readonly List<ReleasedVirtualRange> _releasedVirtualRanges = new();
@@ -70,6 +89,33 @@ public static class KernelRuntimeCompatExports
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_USLEEP"), "1", StringComparison.Ordinal);
     private static readonly bool _traceGuestThreads =
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_GUEST_THREADS"), "1", StringComparison.Ordinal);
+
+    // Kyty exposes these platform-library hooks as successful no-ops.  Unity
+    // probes them during input/IME setup; returning an unresolved-import error
+    // makes that probe retry continuously.
+    [SysAbiExport(
+        Nid = "rIZnR6eSpvk",
+        ExportName = "scePadResetOrientation",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libScePad")]
+    public static int PadResetOrientation(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "VkqLPArfFdc",
+        ExportName = "sceImeKeyboardGetInfo",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceIme")]
+    public static int ImeKeyboardGetInfo(CpuContext ctx)
+    {
+        // Kyty accepts a null/opaque info buffer and reports success. The
+        // title only uses this as a capability probe.
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
 
     [ThreadStatic]
     private static int _shortUsleepCount;
@@ -1186,11 +1232,165 @@ public static class KernelRuntimeCompatExports
         LibraryName = "libKernel")]
     public static int KernelRtldSetApplicationHeapApi(CpuContext ctx)
     {
+        // Kyty exposes this as a void SysV call. The import bridge normally
+        // writes an integer return value when an export did not touch RAX;
+        // doing that here clobbers a live guest value used by libc's heap
+        // setup continuation. Preserve it explicitly.
+        var preservedRax = ctx[CpuRegister.Rax];
+        var apiAddress = ctx[CpuRegister.Rdi];
         lock (_stateGate)
         {
-            _applicationHeapApiAddress = ctx[CpuRegister.Rdi];
+            _applicationHeapApiAddress = apiAddress;
+            Array.Clear(_applicationHeapApi);
+            if (apiAddress != 0)
+            {
+                for (var index = 0; index < _applicationHeapApi.Length; index++)
+                {
+                    if (!ctx.TryReadUInt64(apiAddress + ((ulong)index * sizeof(ulong)),
+                            out _applicationHeapApi[index]))
+                    {
+                        Array.Clear(_applicationHeapApi);
+                        _applicationHeapApiAddress = 0;
+                        break;
+                    }
+                }
+            }
         }
 
+        ctx[CpuRegister.Rax] = preservedRax;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "kOcnerypnQA",
+        ExportName = "sceKernelGettimezone",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelGetTimezone(CpuContext ctx)
+    {
+        var outputAddress = ctx[CpuRegister.Rdi];
+        if (outputAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        // KernelTimezone is { int32 minuteswest, int32 dsttime }. Kyty uses
+        // Windows' Bias (minutes west of UTC); .NET exposes the inverse UTC
+        // offset, hence the negation.
+        var localNow = DateTimeOffset.Now;
+        var minutesWest = checked((int)-localNow.Offset.TotalMinutes);
+        var dstTime = TimeZoneInfo.Local.IsDaylightSavingTime(localNow) ? 1 : 0;
+        if (!TryWriteInt32(ctx, outputAddress, minutesWest) ||
+            !TryWriteInt32(ctx, outputAddress + sizeof(int), dstTime))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "-ZR+hG7aDHw",
+        ExportName = "sceKernelSleep",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelSleep(CpuContext ctx)
+    {
+        // Kyty implements this as the seconds counterpart to sceKernelUsleep.
+        // Let the cooperative guest scheduler progress before yielding the host
+        // thread so a sleep never starves ready guest workers.
+        GuestThreadExecution.Scheduler?.Pump(ctx, "sceKernelSleep");
+        var seconds = ctx[CpuRegister.Rdi];
+        if (seconds != 0)
+        {
+            var microseconds = seconds > ulong.MaxValue / 1_000_000UL
+                ? long.MaxValue
+                : (long)Math.Min(seconds * 1_000_000UL, (ulong)long.MaxValue);
+            HostTiming.SleepMicroseconds(microseconds);
+        }
+        else
+        {
+            Thread.Yield();
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "L0v2Go5jOuM",
+        ExportName = "sceKernelGetPrtAperture",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelGetPrtAperture(CpuContext ctx)
+    {
+        var apertureId = unchecked((int)ctx[CpuRegister.Rdi]);
+        var baseOutput = ctx[CpuRegister.Rsi];
+        var sizeOutput = ctx[CpuRegister.Rdx];
+        if (apertureId < 0 || apertureId >= _prtApertures.Length)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        if (baseOutput == 0 || sizeOutput == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        (ulong Base, ulong Size) aperture;
+        lock (_prtApertureGate)
+        {
+            aperture = _prtApertures[apertureId];
+        }
+
+        if (!ctx.TryWriteUInt64(baseOutput, aperture.Base) ||
+            !ctx.TryWriteUInt64(sizeOutput, aperture.Size))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "tU5e3f9gSiU",
+        ExportName = "sceKernelIsTrinityMode",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelIsTrinityMode(CpuContext ctx)
+    {
+        // Kyty reports base-PS5 mode. SharpEmu likewise exposes no Trinity
+        // hardware-specific path to the guest.
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "g0VTBxfJyu0",
+        ExportName = "sceKernelGetCurrentCpu",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelGetCurrentCpu(CpuContext ctx)
+    {
+        // Kyty returns a stable logical CPU zero. This avoids exposing host
+        // topology as a PS5 affinity index.
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "uvT2iYBBnkY",
+        ExportName = "sceKernelSync",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelSync(CpuContext ctx)
+    {
+        // Kyty exposes sync as a successful no-op. Host-backed guest files
+        // flush on their own close/write paths, so there is no separate global
+        // cache to drain here.
+        ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -1538,6 +1738,45 @@ public static class KernelRuntimeCompatExports
         Span<byte> uuid = stackalloc byte[16];
         RandomNumberGenerator.Fill(uuid);
         if (!ctx.Memory.TryWrite(uuidAddress, uuid))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // libSceSysmodule forwards this ABI unchanged to libKernel.  Unity's
+    // video/unwind path imports it through the sysmodule library rather than
+    // the otherwise equivalent sceKernel export.
+    [SysAbiExport(
+        Nid = "4fU5yvOkVG4",
+        ExportName = "sceSysmoduleGetModuleInfoForUnwind",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSysmodule")]
+    public static int SysmoduleGetModuleInfoForUnwind(CpuContext ctx) => KernelGetModuleInfoForUnwind(ctx);
+
+    [SysAbiExport(
+        Nid = "DLORcroUqbc",
+        ExportName = "sceKernelGetOpenPsId",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelGetOpenPsId(CpuContext ctx)
+    {
+        var outputAddress = ctx[CpuRegister.Rdi];
+        if (outputAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        // Same deterministic non-console identity Kyty supplies. It is an
+        // opaque 16-byte platform identifier, not the host's device identity.
+        ReadOnlySpan<byte> openPsId =
+        [
+            0x4B, 0x79, 0x74, 0x79, 0x4F, 0x70, 0x65, 0x6E,
+            0x50, 0x73, 0x49, 0x64, 0x00, 0x00, 0x00, 0x01,
+        ];
+        if (!ctx.Memory.TryWrite(outputAddress, openPsId))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }

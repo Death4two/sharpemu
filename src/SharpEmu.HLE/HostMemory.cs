@@ -21,6 +21,8 @@ public static unsafe class HostMemory
     public const uint MEM_RELEASE = 0x8000;
     public const uint MEM_FREE_STATE = 0x10000;
     public const uint MEM_PRIVATE = 0x20000;
+    private const uint MEM_RESERVE_PLACEHOLDER = 0x00040000;
+    private const uint MEM_REPLACE_PLACEHOLDER = 0x00004000;
 
     public const uint PAGE_NOACCESS = 0x01;
     public const uint PAGE_READONLY = 0x02;
@@ -49,6 +51,34 @@ public static unsafe class HostMemory
     {
         if (OperatingSystem.IsWindows())
         {
+            var reserve = (allocationType & MEM_RESERVE) != 0;
+            var commit = (allocationType & MEM_COMMIT) != 0;
+            if (reserve && !commit)
+            {
+                var placeholder = Win32VirtualAlloc2(
+                    Win32GetCurrentProcess(), address, size,
+                    MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, protect, null, 0);
+                if (placeholder != null)
+                {
+                    return placeholder;
+                }
+            }
+
+            // A placeholder cannot be committed through VirtualAlloc. Replace
+            // precisely the requested slice, preserving its neighbours for
+            // later fixed guest mappings just as Kyty's address space does.
+            if (commit && address != null)
+            {
+                var replacement = Win32VirtualAlloc2(
+                    Win32GetCurrentProcess(), address, size,
+                    MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                    protect, null, 0);
+                if (replacement != null)
+                {
+                    return replacement;
+                }
+            }
+
             return Win32VirtualAlloc(address, size, allocationType, protect);
         }
 
@@ -101,6 +131,16 @@ public static unsafe class HostMemory
 
     [DllImport("kernel32.dll", EntryPoint = "VirtualAlloc", SetLastError = true)]
     private static extern void* Win32VirtualAlloc(void* lpAddress, nuint dwSize, uint flAllocationType, uint flProtect);
+
+    [DllImport("kernelbase.dll", EntryPoint = "VirtualAlloc2", SetLastError = true)]
+    private static extern void* Win32VirtualAlloc2(
+        void* process,
+        void* baseAddress,
+        nuint size,
+        uint allocationType,
+        uint pageProtection,
+        void* extendedParameters,
+        uint parameterCount);
 
     [DllImport("kernel32.dll", EntryPoint = "VirtualFree", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

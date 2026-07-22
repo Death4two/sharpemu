@@ -3,6 +3,7 @@
 
 using SharpEmu.Core.Memory;
 using SharpEmu.Core.Loader;
+using SharpEmu.HLE;
 using SharpEmu.HLE.Host;
 using Xunit;
 
@@ -96,6 +97,44 @@ public sealed class GuestMemoryAllocatorTests
     }
 
     [Fact]
+    public void CommitFixedRange_CommitsExistingReservedPagesInPlace()
+    {
+        const ulong address = 0x00005000_0000_0000;
+        const ulong pageSize = 0x1000;
+        using var host = new LazyHostMemory(address);
+        using var memory = new PhysicalVirtualMemory(host);
+        memory.AllocateAt(address, (4UL << 30) + pageSize, executable: false, allowAlternative: false);
+        host.CommitCalls.Clear();
+
+        Assert.True(memory.TryCommitFixedRange(address + 0x123, pageSize + 1, executable: false));
+        Assert.Equal(
+            [
+                (address, pageSize, HostPageProtection.ReadWrite),
+                (address + pageSize, pageSize, HostPageProtection.ReadWrite),
+            ],
+            host.CommitCalls);
+    }
+
+    [Fact]
+    public void TryProtect_CommitsLazyReservationBeforeChangingProtection()
+    {
+        const ulong address = 0x00005000_0000_0000;
+        const ulong pageSize = 0x1000;
+        using var host = new LazyHostMemory(address);
+        using var memory = new PhysicalVirtualMemory(host);
+        memory.AllocateAt(address, (4UL << 30) + pageSize, executable: false, allowAlternative: false);
+        host.CommitCalls.Clear();
+
+        Assert.True(memory.TryProtect(address + 0x123, pageSize + 1, GuestPageProtection.Read));
+        Assert.Equal(
+            [
+                (address, pageSize, HostPageProtection.ReadWrite),
+                (address + pageSize, pageSize, HostPageProtection.ReadWrite),
+            ],
+            host.CommitCalls);
+    }
+
+    [Fact]
     public void AlignedAllocationDoesNotRetainOverallocatedMappingsOutsideMacOS()
     {
         if (OperatingSystem.IsMacOS())
@@ -169,6 +208,23 @@ public sealed class GuestMemoryAllocatorTests
 
         Assert.False(memory.TryBackFixedRange(rangeBase, rangeSize, executable: false));
         Assert.Empty(host.AllocationCalls);
+    }
+
+    [Fact]
+    public void PersistentFixedReservationSurvivesLoaderClear()
+    {
+        const ulong imageBase = 0x0000000800000000;
+        const ulong reservationSize = 0x04000000;
+        using var memory = new PhysicalVirtualMemory(new FakeHostMemory());
+
+        Assert.True(memory.TryReservePersistentAtExact(imageBase, reservationSize));
+        Assert.True(memory.HasPersistentReservationCovering(imageBase, 0x1B922D0));
+
+        memory.Clear(preservePersistentReservations: true);
+
+        Assert.True(memory.HasPersistentReservationCovering(imageBase, 0x1B922D0));
+        memory.Clear();
+        Assert.False(memory.HasPersistentReservationCovering(imageBase, 0x1000));
     }
 
     private sealed class PartialOverlapHostMemory : IHostMemory, IDisposable

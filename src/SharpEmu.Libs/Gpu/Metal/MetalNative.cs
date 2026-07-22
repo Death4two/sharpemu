@@ -234,6 +234,16 @@ internal static partial class MetalNative
     [LibraryImport(ObjCLibrary, EntryPoint = "objc_msgSend")]
     public static partial void SendVoidDouble(nint receiver, nint selector, double argument);
 
+    /// <summary>Three-float render-encoder state sends, e.g.
+    /// <c>setDepthBias:slopeScale:clamp:</c>.</summary>
+    [LibraryImport(ObjCLibrary, EntryPoint = "objc_msgSend")]
+    public static partial void SendVoidFloat3(
+        nint receiver,
+        nint selector,
+        float argument0,
+        float argument1,
+        float argument2);
+
     [LibraryImport(ObjCLibrary, EntryPoint = "objc_msgSend")]
     public static partial void SendVoidSize(nint receiver, nint selector, CGSize size);
 
