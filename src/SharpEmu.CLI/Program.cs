@@ -579,12 +579,7 @@ internal static partial class Program
             return false;
         }
 
-        var childArgs = new string[args.Length + 1];
-        childArgs[0] = MitigatedChildFlag;
-        for (var i = 0; i < args.Length; i++)
-        {
-            childArgs[i + 1] = args[i];
-        }
+        string[] childArgs = [MitigatedChildFlag, .. args];
 
         var commandLine = BuildCommandLine(processPath, childArgs);
         var startupInfoEx = new STARTUPINFOEX();
