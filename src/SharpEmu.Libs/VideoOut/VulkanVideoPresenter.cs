@@ -1241,6 +1241,8 @@ internal static unsafe class VulkanVideoPresenter
         byte[]? Pixels,
         uint FillValue);
 
+    private sealed record VulkanGuestImageRegistration(GuestRenderTarget Target);
+
     /// <summary>
     /// Reports the extent of a live guest image so DMA writes to its backing
     /// memory can be mirrored into the Vulkan image (PS5 render targets alias
@@ -1803,9 +1805,13 @@ internal static unsafe class VulkanVideoPresenter
 
     // Display buffers registered through sceVideoOutRegisterBuffers remain
     // valid flip targets even before AGC has rendered into them.
-    internal static void RegisterKnownDisplayBuffer(ulong address, uint guestFormat)
+    internal static void RegisterKnownDisplayBuffer(
+        ulong address,
+        uint guestFormat,
+        uint width,
+        uint height)
     {
-        if (address == 0 || guestFormat == 0)
+        if (address == 0 || guestFormat == 0 || width == 0 || height == 0)
         {
             return;
         }
@@ -1813,6 +1819,17 @@ internal static unsafe class VulkanVideoPresenter
         lock (_gate)
         {
             _availableGuestImages[address] = guestFormat;
+            if (!_closed && _thread is not null)
+            {
+                // Kyty creates a native VideoOut surface as soon as the guest
+                // registers its display buffers.  Do the Vulkan allocation on
+                // the render thread, then clear it once so an early ordered
+                // flip has a defined image rather than no host resource.
+                var registrationSequence = EnqueueGuestWorkLocked(
+                    new VulkanGuestImageRegistration(
+                        new GuestRenderTarget(address, width, height, guestFormat, 0)));
+                _guestImageWorkSequences[address] = registrationSequence;
+            }
         }
     }
 
@@ -2382,9 +2399,12 @@ internal static unsafe class VulkanVideoPresenter
         }
 
         var queue = _submittingGuestQueue ?? VulkanGuestQueueIdentity.Default;
+        // Capture dependencies before publishing this work as the queue tail:
+        // a global ordered-action barrier must cover preceding work, never
+        // itself.
+        var requiredSequence = GetGuestWorkDependencyLocked(work);
         var sequence = ++_enqueuedGuestWorkSequence;
         _lastEnqueuedGuestWorkByQueue[queue.Name] = sequence;
-        var requiredSequence = GetGuestWorkDependencyLocked(work);
         if (!_pendingGuestWorkByQueue.TryGetValue(queue.Name, out var pendingQueue))
         {
             pendingQueue = new LinkedList<PendingGuestWork>();
@@ -2432,6 +2452,30 @@ internal static unsafe class VulkanVideoPresenter
 
     private static long GetGuestWorkDependencyLocked(object work)
     {
+        // Ordered CPU-visible actions are global guest synchronization
+        // points. The presenter round-robins logical graphics/compute queues,
+        // so preserving only the submitting queue's FIFO order would let an
+        // action on graphics run before an earlier compute submission. In
+        // particular, sceAgcSuspendPoint maps to Kyty's GraphicsRunDone(),
+        // which waits every graphics and compute ring. Depend on the highest
+        // sequence observed across all queues before this action was queued.
+        if (work is VulkanOrderedGuestAction)
+        {
+            var barrierSequence = 0L;
+            foreach (var sequence in _lastEnqueuedGuestWorkByQueue.Values)
+            {
+                barrierSequence = Math.Max(barrierSequence, sequence);
+            }
+
+            return barrierSequence;
+        }
+
+        if (work is VulkanOrderedGuestFlip flip &&
+            _guestImageWorkSequences.TryGetValue(flip.Address, out var registrationSequence))
+        {
+            return registrationSequence;
+        }
+
         IReadOnlyList<GuestDrawTexture> textures = work switch
         {
             VulkanOffscreenGuestDraw draw => draw.Draw.Textures,
@@ -2480,6 +2524,8 @@ internal static unsafe class VulkanVideoPresenter
             VulkanComputeGuestDispatch compute => StorageAddresses(compute.Textures),
             VulkanGuestImageWrite imageWrite when imageWrite.Address != 0 =>
                 new[] { imageWrite.Address },
+            VulkanGuestImageRegistration registration when registration.Target.Address != 0 =>
+                new[] { registration.Target.Address },
             _ => Array.Empty<ulong>(),
         };
         foreach (var address in addresses.Distinct())
@@ -11286,6 +11332,27 @@ internal static unsafe class VulkanVideoPresenter
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
+        private void ExecuteGuestImageRegistration(VulkanGuestImageRegistration work)
+        {
+            if (_deviceLost)
+            {
+                return;
+            }
+
+            var format = GetTextureFormat(work.Target.Format, work.Target.NumberType);
+            if (format == Format.Undefined)
+            {
+                return;
+            }
+
+            var image = GetOrCreateGuestImage(work.Target, format);
+            if (!image.Initialized)
+            {
+                ExecuteGuestImageWrite(new VulkanGuestImageWrite(work.Target.Address, null, 0));
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
         private void ExecuteGuestImageWrite(VulkanGuestImageWrite work)
         {
             if (_deviceLost || !_guestImages.TryGetValue(work.Address, out var target))
@@ -13179,6 +13246,9 @@ internal static unsafe class VulkanVideoPresenter
                             break;
                         case VulkanGuestImageWrite guestImageWrite:
                             ExecuteGuestImageWrite(guestImageWrite);
+                            break;
+                        case VulkanGuestImageRegistration guestImageRegistration:
+                            ExecuteGuestImageRegistration(guestImageRegistration);
                             break;
                         case VulkanOrderedGuestAction orderedAction:
                             deferGuestWork = !TryExecuteOrderedGuestAction(orderedAction);

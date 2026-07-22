@@ -225,7 +225,11 @@ internal static partial class MetalVideoPresenter
         }
     }
 
-    public static void RegisterKnownDisplayBuffer(ulong address, uint guestFormat)
+    public static void RegisterKnownDisplayBuffer(
+        ulong address,
+        uint guestFormat,
+        uint width,
+        uint height)
     {
         if (address == 0 || guestFormat == 0)
         {

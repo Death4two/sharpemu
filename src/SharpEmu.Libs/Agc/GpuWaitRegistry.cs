@@ -47,6 +47,10 @@ internal static class GpuWaitRegistry
         // (Stopwatch ticks) after which the waiter is resumed even if unsatisfied,
         // so a legitimately empty indirect dispatch can never stall forever.
         public long RetryDeadlineTicks;
+        // A conditional indirect-buffer may suspend inside its selected child
+        // stream.  After that child resumes, the parent stream must continue
+        // immediately after the branch packet.
+        public object? Continuation;
     }
 
     private static readonly object _gate = new();

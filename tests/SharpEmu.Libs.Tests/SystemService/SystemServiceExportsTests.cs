@@ -59,4 +59,25 @@ public sealed class SystemServiceExportsTests
         Assert.True(memory.TryRead(MemoryBase, flag));
         Assert.Equal(0, flag[0]);
     }
+
+    [Fact]
+    public void StatusAndHdrToneMapMatchKytyDefaults()
+    {
+        var memory = new FakeCpuMemory(MemoryBase, 160);
+        var context = new CpuContext(memory, Generation.Gen5);
+        Assert.True(memory.TryWrite(MemoryBase, Enumerable.Repeat((byte)0xA5, 160).ToArray()));
+        context[CpuRegister.Rdi] = MemoryBase;
+        Assert.Equal(0, SystemServiceExports.SystemServiceGetStatus(context));
+        Span<byte> status = stackalloc byte[136];
+        Assert.True(memory.TryRead(MemoryBase, status));
+        Assert.All(status.ToArray(), value => Assert.Equal(0, value));
+
+        context[CpuRegister.Rdi] = MemoryBase + 140;
+        Assert.Equal(0, SystemServiceExports.SystemServiceGetHdrToneMapLuminance(context));
+        Span<byte> luminance = stackalloc byte[12];
+        Assert.True(memory.TryRead(MemoryBase + 140, luminance));
+        Assert.Equal(80.0f, System.Buffers.Binary.BinaryPrimitives.ReadSingleLittleEndian(luminance));
+        Assert.Equal(1000.0f, System.Buffers.Binary.BinaryPrimitives.ReadSingleLittleEndian(luminance[4..]));
+        Assert.Equal(0.0f, System.Buffers.Binary.BinaryPrimitives.ReadSingleLittleEndian(luminance[8..]));
+    }
 }

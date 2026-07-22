@@ -49,4 +49,21 @@ public sealed class SysAbiRegistryTests
         Assert.Equal("sceKernelWaitSema", export.Name);
         Assert.Equal("libKernel", export.LibraryName);
     }
+
+    [Theory]
+    [InlineData("RpQJJVKTiFM", "sceKernelGetModuleInfoForUnwind", "libKernel")]
+    [InlineData("4fU5yvOkVG4", "sceSysmoduleGetModuleInfoForUnwind", "libSceSysmodule")]
+    [InlineData("VAzswvTOCzI", "sceKernelUnlink", "libKernel")]
+    public void RegistryResolvesKytyBackedRuntimeAliases(
+        string nid,
+        string name,
+        string libraryName)
+    {
+        var manager = new ModuleManager();
+        manager.RegisterExports(SharpEmu.Generated.SysAbiExportRegistry.CreateExports(Generation.Gen5));
+
+        Assert.True(manager.TryGetExport(nid, out var export), $"NID {nid} did not register.");
+        Assert.Equal(name, export.Name);
+        Assert.Equal(libraryName, export.LibraryName);
+    }
 }

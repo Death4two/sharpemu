@@ -11,20 +11,21 @@ namespace SharpEmu.Libs.Audio;
 
 public static class AudioOut2Exports
 {
-    // FMOD's PS5 backend allocates this ABI structure as four 16-byte lanes.
-    // Clearing 0x80 bytes here overwrote the caller's stack canary immediately
-    // following the 0x40-byte parameter block.
+    // AudioOut2ContextParam: six uints followed by ten reserved uints.
     private const int AudioOut2ContextParamSize = 0x40;
     private const int AudioOut2ContextMemorySize = 0x10000;
     private const int AudioOut2ContextMemoryAlignment = 0x10000;
-    private static long _nextContextHandle = 1;
-    private static long _nextUserHandle = 1;
-    private static int _nextPortId;
+    private static long _nextContextHandle;
+    private static long _nextUserHandle;
+    private static long _nextPortId;
     private static long _pushTraceCount;
 
     // Per-context audio parameters captured at ContextCreate so ContextAdvance
     // can pace to the real playback cadence (grain samples at the sample rate).
     private static readonly ConcurrentDictionary<ulong, ContextState> Contexts = new();
+    private static readonly ConcurrentDictionary<ulong, PortState> Ports = new();
+
+    private sealed record PortState(ulong Context, ushort Type, uint DataFormat, uint SamplingFrequency);
 
     private sealed class ContextState
     {
@@ -94,10 +95,12 @@ public static class AudioOut2Exports
 
         Span<byte> param = stackalloc byte[AudioOut2ContextParamSize];
         param.Clear();
-        BinaryPrimitives.WriteUInt32LittleEndian(param[0x00..], AudioOut2ContextParamSize);
-        BinaryPrimitives.WriteUInt32LittleEndian(param[0x04..], 2);
-        BinaryPrimitives.WriteUInt32LittleEndian(param[0x08..], 48000);
-        BinaryPrimitives.WriteUInt32LittleEndian(param[0x0C..], 0x400);
+        // libAudioOut2 context defaults.
+        BinaryPrimitives.WriteUInt32LittleEndian(param[0x00..], 256); // max_ports
+        BinaryPrimitives.WriteUInt32LittleEndian(param[0x04..], 256); // max_object_ports
+        BinaryPrimitives.WriteUInt32LittleEndian(param[0x0C..], 4);   // queue_depth
+        BinaryPrimitives.WriteUInt32LittleEndian(param[0x10..], 512); // num_grains
+        BinaryPrimitives.WriteUInt32LittleEndian(param[0x14..], 1);   // flags
 
         return ctx.Memory.TryWrite(paramAddress, param)
             ? SetReturn(ctx, 0)
@@ -118,14 +121,17 @@ public static class AudioOut2Exports
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        Span<byte> memoryInfo = stackalloc byte[0x20];
-        memoryInfo.Clear();
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x00..], AudioOut2ContextMemorySize);
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x08..], AudioOut2ContextMemoryAlignment);
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x10..], AudioOut2ContextMemorySize);
-        BinaryPrimitives.WriteUInt64LittleEndian(memoryInfo[0x18..], AudioOut2ContextMemoryAlignment);
+        Span<byte> param = stackalloc byte[AudioOut2ContextParamSize];
+        if (!ctx.Memory.TryRead(paramAddress, param))
+        {
+            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
 
-        return ctx.Memory.TryWrite(memoryInfoAddress, memoryInfo)
+        var queueDepth = BinaryPrimitives.ReadUInt32LittleEndian(param[0x0C..]);
+        if (queueDepth == 0) queueDepth = 4;
+        // AudioOut2ContextQueryMemory returns one size_t, not a fabricated
+        // memory-info structure: 0x10000 + queue_depth * 0x590.
+        return TryWriteUInt64(ctx, memoryInfoAddress, AudioOut2ContextMemorySize + (ulong)queueDepth * 0x590UL)
             ? SetReturn(ctx, 0)
             : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
@@ -141,7 +147,9 @@ public static class AudioOut2Exports
         var memoryAddress = ctx[CpuRegister.Rsi];
         var memorySize = ctx[CpuRegister.Rdx];
         var outContextAddress = ctx[CpuRegister.Rcx];
-        if (paramAddress == 0 || memoryAddress == 0 || memorySize == 0 || outContextAddress == 0)
+        // The caller work buffer is optional and is not pre-sized here.
+        // non-null or pre-sized for context creation.
+        if (paramAddress == 0 || outContextAddress == 0)
         {
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
@@ -150,17 +158,11 @@ public static class AudioOut2Exports
         // context can pace advances to the real audio cadence.
         uint channels = 2;
         uint frequency = 48000;
-        uint grain = 256;
+        uint grain = 512;
         Span<byte> param = stackalloc byte[AudioOut2ContextParamSize];
         if (ctx.Memory.TryRead(paramAddress, param))
         {
-            var pc = BinaryPrimitives.ReadUInt32LittleEndian(param[0x04..]);
-            var pf = BinaryPrimitives.ReadUInt32LittleEndian(param[0x08..]);
-            var pg = BinaryPrimitives.ReadUInt32LittleEndian(param[0x0C..]);
-            if (pc is > 0 and <= 8) channels = pc;
-            if (pf is >= 8000 and <= 192000) frequency = pf;
-            // Values below one cache line are flags/counts in observed PS5
-            // callers, not audio grains. Keep the hardware-sized default.
+            var pg = BinaryPrimitives.ReadUInt32LittleEndian(param[0x10..]);
             if (pg is >= 64 and <= 0x4000) grain = pg;
             TraceAudioOut2($"context-param address=0x{paramAddress:X} bytes={Convert.ToHexString(param)}");
         }
@@ -257,17 +259,31 @@ public static class AudioOut2Exports
         LibraryName = "libSceAudioOut2")]
     public static int AudioOut2PortCreate(CpuContext ctx)
     {
-        var type = unchecked((int)ctx[CpuRegister.Rdi]);
+        var contextHandle = ctx[CpuRegister.Rdi];
         var paramAddress = ctx[CpuRegister.Rsi];
         var outPortAddress = ctx[CpuRegister.Rdx];
-        var contextAddress = ctx[CpuRegister.Rcx];
-        if (type < 0 || type > 255 || paramAddress == 0 || outPortAddress == 0 || contextAddress == 0)
+        if (paramAddress == 0 || outPortAddress == 0)
         {
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        var portId = unchecked((uint)Interlocked.Increment(ref _nextPortId)) & 0xFF;
-        var handle = 0x2000_0000UL | ((ulong)(uint)type << 16) | portId;
+        Span<byte> parameter = stackalloc byte[64];
+        if (!ctx.Memory.TryRead(paramAddress, parameter))
+        {
+            return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        var handle = unchecked((ulong)Interlocked.Increment(ref _nextPortId));
+        if (handle > 256)
+        {
+            return SetReturn(ctx, unchecked((int)0x80268012)); // AUDIO_OUT2_ERROR_PORT_FULL
+        }
+
+        Ports[handle] = new PortState(
+            contextHandle,
+            BinaryPrimitives.ReadUInt16LittleEndian(parameter),
+            BinaryPrimitives.ReadUInt32LittleEndian(parameter[4..]),
+            BinaryPrimitives.ReadUInt32LittleEndian(parameter[8..]));
         return TryWriteUInt64(ctx, outPortAddress, handle)
             ? SetReturn(ctx, 0)
             : SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
@@ -294,14 +310,13 @@ public static class AudioOut2Exports
             return SetReturn(ctx, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        var type = (int)((handle >> 16) & 0xFF);
-        Span<byte> state = stackalloc byte[0x20];
+        Span<byte> state = stackalloc byte[64];
         state.Clear();
-        var output = type == 2 ? 0x40 : 0x01;
-        var channels = type == 2 ? 1 : 2;
-        BinaryPrimitives.WriteUInt16LittleEndian(state[0x00..], unchecked((ushort)output));
-        state[0x02] = unchecked((byte)channels);
-        BinaryPrimitives.WriteInt16LittleEndian(state[0x04..], -1);
+        BinaryPrimitives.WriteUInt16LittleEndian(state, 1);
+        state[0x02] = Ports.TryGetValue(handle, out var port)
+            ? GetChannelCount(port.DataFormat)
+            : (byte)2;
+        BinaryPrimitives.WriteInt16LittleEndian(state[0x04..], 127);
 
         return ctx.Memory.TryWrite(stateAddress, state)
             ? SetReturn(ctx, 0)
@@ -337,7 +352,11 @@ public static class AudioOut2Exports
         ExportName = "sceAudioOut2PortDestroy",
         Target = Generation.Gen5,
         LibraryName = "libSceAudioOut2")]
-    public static int AudioOut2PortDestroy(CpuContext ctx) => SetReturn(ctx, 0);
+    public static int AudioOut2PortDestroy(CpuContext ctx)
+    {
+        Ports.TryRemove(ctx[CpuRegister.Rdi], out _);
+        return SetReturn(ctx, 0);
+    }
 
     [SysAbiExport(
         Nid = "IaZXJ9M79uo",
@@ -372,6 +391,12 @@ public static class AudioOut2Exports
         Span<byte> buffer = stackalloc byte[sizeof(ulong)];
         BinaryPrimitives.WriteUInt64LittleEndian(buffer, value);
         return ctx.Memory.TryWrite(address, buffer);
+    }
+
+    private static byte GetChannelCount(uint dataFormat)
+    {
+        var channels = (dataFormat >> 8) & 0xFF;
+        return unchecked((byte)(channels == 0 ? 2 : Math.Min(channels, 16)));
     }
 
     private static int SetReturn(CpuContext ctx, int result)

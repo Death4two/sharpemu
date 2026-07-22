@@ -79,28 +79,10 @@ public static class RtcExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        if (!TryConvertTickToDateTime(tickLocal, out var localDateTime))
-        {
-            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
-        }
-
-        // TryConvertTickToDateTime yields a Utc-kind DateTime, but here the tick is a local
-        // wall-clock time. ConvertTimeToUtc throws ArgumentException when a Utc-kind value is
-        // paired with a non-UTC source zone, so on any host not set to UTC this would always
-        // fail. Re-tag as Unspecified so the value is interpreted as local time and converted.
-        localDateTime = DateTime.SpecifyKind(localDateTime, DateTimeKind.Unspecified);
-
-        DateTime utcDateTime;
-        try
-        {
-            utcDateTime = TimeZoneInfo.ConvertTimeToUtc(localDateTime, TimeZoneInfo.Local);
-        }
-        catch (ArgumentException)
-        {
-            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
-        }
-
-        if (!TryWriteTickFromDateTime(ctx, tickUtcAddress, utcDateTime))
+        // Keep RTC ticks host-independent: both representations use
+        // the same UTC tick value. Do not leak the host timezone into guest
+        // execution.
+        if (!ctx.TryWriteUInt64(tickUtcAddress, tickLocal))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
@@ -127,22 +109,9 @@ public static class RtcExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        if (!TryConvertTickToDateTime(tickUtc, out var utcDateTime))
-        {
-            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
-        }
-
-        DateTime localDateTime;
-        try
-        {
-            localDateTime = TimeZoneInfo.ConvertTimeFromUtc(utcDateTime, TimeZoneInfo.Local);
-        }
-        catch (ArgumentException)
-        {
-            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
-        }
-
-        if (!TryWriteTickFromDateTime(ctx, tickLocalAddress, localDateTime))
+        // See sceRtcConvertLocalTimeToUtc: local time is a
+        // host-independent alias of the UTC tick.
+        if (!ctx.TryWriteUInt64(tickLocalAddress, tickUtc))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }

@@ -1826,7 +1826,11 @@ public sealed partial class DirectExecutionBackend
 			"WKAXJ4XBPQ4" or // scePthreadCondWait
 			"BmMjYxmew1w" or // scePthreadCondTimedwait
 			"Op8TBGY5KHg" or // pthread_cond_wait
-			"27bAgiJmOh0";   // pthread_cond_timedwait
+			"27bAgiJmOh0" or // pthread_cond_timedwait
+			// sceUserServiceGetEvent deliberately returns NO_EVENT after
+			// its one login notification. Titles legally poll it in their main
+			// loop, so this must reset the hang watchdog like a wait boundary.
+			"yH17Q6NWtVg";   // sceUserServiceGetEvent
 
 	private void ResetImportLoopPattern()
 	{

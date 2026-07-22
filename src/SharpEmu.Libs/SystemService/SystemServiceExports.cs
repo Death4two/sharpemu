@@ -13,7 +13,9 @@ public static class SystemServiceExports
     private const int OrbisSystemServiceErrorParameter = unchecked((int)0x80A10003);
     private const int OrbisSystemServiceErrorNoEvent = unchecked((int)0x80A10004);
     private const int SystemServiceEventSize = sizeof(int) + 8192;
-    private const int SystemServiceStatusSize = 0x0C;
+    // int32 event_num + three bools + 127 reserved bytes, rounded to the
+    // struct's four-byte alignment (Kyty's SystemServiceStatus).
+    private const int SystemServiceStatusSize = 136;
     private const int DisplaySafeAreaInfoSize = sizeof(float) + 128;
     private const int HdrToneMapLuminanceSize = sizeof(float) * 3;
 
@@ -135,8 +137,14 @@ public static class SystemServiceExports
         {
             1 or 2 or 3 or 1000 => 1,
             4 => 180,
-            _ => 0,
+            5 or 7 => 0,
+            _ => int.MinValue,
         };
+
+        if (value == int.MinValue)
+        {
+            return ctx.SetReturn(OrbisSystemServiceErrorParameter);
+        }
 
         Span<byte> valueBytes = stackalloc byte[sizeof(int)];
         BinaryPrimitives.WriteInt32LittleEndian(valueBytes, value);
@@ -152,7 +160,7 @@ public static class SystemServiceExports
         LibraryName = "libSceSystemService")]
     public static int SystemServiceParamGetString(CpuContext ctx)
     {
-        _ = unchecked((int)ctx[CpuRegister.Rdi]); // parameter id (nickname, etc.)
+        var parameterId = unchecked((int)ctx[CpuRegister.Rdi]);
         var bufferAddress = ctx[CpuRegister.Rsi];
         var bufferSize = unchecked((int)ctx[CpuRegister.Rdx]);
         if (bufferAddress == 0 || bufferSize <= 0)
@@ -160,11 +168,13 @@ public static class SystemServiceExports
             return ctx.SetReturn(OrbisSystemServiceErrorParameter);
         }
 
-        // String params are typically the user nickname. Callers that gate UI
-        // or text setup on a successful read (and skip it on failure) stall on
-        // a black screen when this returns NOT_FOUND, so return a neutral
-        // non-empty default and success.
-        var value = System.Text.Encoding.UTF8.GetBytes("SharpEmu");
+        // Kyty implements the system-name parameter only.
+        if (parameterId != 6)
+        {
+            return ctx.SetReturn(OrbisSystemServiceErrorParameter);
+        }
+
+        var value = System.Text.Encoding.UTF8.GetBytes("Kyty");
         var writeLength = Math.Min(value.Length, bufferSize - 1);
         Span<byte> output = stackalloc byte[writeLength + 1];
         value.AsSpan(0, writeLength).CopyTo(output);
@@ -190,7 +200,6 @@ public static class SystemServiceExports
         Span<byte> status = stackalloc byte[SystemServiceStatusSize];
         status.Clear();
         BinaryPrimitives.WriteInt32LittleEndian(status, 0);
-        status[0x06] = 1;
 
         return ctx.Memory.TryWrite(statusAddress, status)
             ? ctx.SetReturn(0)
@@ -233,9 +242,9 @@ public static class SystemServiceExports
         }
 
         Span<byte> luminance = stackalloc byte[HdrToneMapLuminanceSize];
-        BinaryPrimitives.WriteSingleLittleEndian(luminance, 1000.0f);
+        BinaryPrimitives.WriteSingleLittleEndian(luminance, 80.0f);
         BinaryPrimitives.WriteSingleLittleEndian(luminance[sizeof(float)..], 1000.0f);
-        BinaryPrimitives.WriteSingleLittleEndian(luminance[(sizeof(float) * 2)..], 0.01f);
+        BinaryPrimitives.WriteSingleLittleEndian(luminance[(sizeof(float) * 2)..], 0.0f);
         return ctx.Memory.TryWrite(luminanceAddress, luminance)
             ? ctx.SetReturn(0)
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);

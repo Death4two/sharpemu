@@ -1951,6 +1951,18 @@ public static partial class KernelMemoryCompatExports
         }
     }
 
+    // PS5 sceKernel-prefixed alias of the POSIX-compatible unlink ABI.
+    // Kyty registers this NID against the same implementation. Aerolib's
+    // catalog associates the alias with a different symbol spelling.
+    #pragma warning disable SHEM004
+    [SysAbiExport(
+        Nid = "VAzswvTOCzI",
+        ExportName = "sceKernelUnlink",
+        Target = Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelUnlinkAlias(CpuContext ctx) => KernelUnlink(ctx);
+    #pragma warning restore SHEM004
+
     [SysAbiExport(
         Nid = "1-LFLmRFxxM",
         ExportName = "sceKernelMkdir",

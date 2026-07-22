@@ -33,10 +33,15 @@ public static partial class AgcExports
 
     private const uint ShaderFileHeader = 0x34333231;
     private const uint ShaderVersion = 0x18;
+    private const uint Graphics5ErrorInvalidPacket = 0x8A6C000C;
+    private const uint Graphics5ErrorInvalidShaderHalves = 0x8A6C0008;
     private const uint ItNop = 0x10;
     private const uint ItSetBase = 0x11;
+    private const uint ItClearState = 0x12;
     private const uint ItIndexBufferSize = 0x13;
     private const uint ItIndexBase = 0x26;
+    private const uint ItSetPredication = 0x20;
+    private const uint ItCondExec = 0x22;
     private const uint ItDrawIndirect = 0x24;
     private const uint ItDrawIndexIndirect = 0x25;
     private const uint ItDrawIndex2 = 0x27;
@@ -45,6 +50,8 @@ public static partial class AgcExports
     private const uint ItNumInstances = 0x2F;
     private const uint ItDrawIndexMultiAuto = 0x30;
     private const uint ItDrawIndexOffset2 = 0x35;
+    private const uint ItDrawIndexIndirectMulti = 0x38;
+    private const uint ItDispatchDrawPreamble = 0x3A;
     private const uint ItWriteData = 0x37;
     private const uint ItDispatchDirect = 0x15;
     private const uint ItDispatchIndirect = 0x16;
@@ -54,10 +61,15 @@ public static partial class AgcExports
     private const uint ItEventWrite = 0x46;
     private const uint ItReleaseMem = 0x49;
     private const uint ItDmaData = 0x50;
+    private const uint ItRewind = 0x59;
+    private const uint ItSetShRegIndirect = 0x63;
+    private const uint ItSetUconfigRegIndirect = 0x64;
     private const uint ItSetContextReg = 0x69;
     private const uint ItSetShReg = 0x76;
     private const uint ItSetUconfigReg = 0x79;
+    private const uint ItSetUconfigRegIndex = 0x7A;
     private const uint ItGetLodStats = 0x8E;
+    private const uint ItSetContextRegIndirect = 0x9F;
     private const uint RZero = 0x00;
     private const uint RDrawIndexAuto = 0x04;
     private const uint RDrawReset = 0x05;
@@ -78,6 +90,7 @@ public static partial class AgcExports
     private const uint RIndexBase = 0x1B;
     private const uint RIndexCount = 0x1C;
     private const uint SpiShaderPgmLoPs = 0x8;
+    private const uint SpiShaderPgmChksumGs = 0x80;
     private const uint SpiShaderPgmHiPs = 0x9;
     private const uint SpiShaderPgmLoEs = 0xC8;
     private const uint SpiShaderPgmHiEs = 0xC9;
@@ -98,6 +111,7 @@ public static partial class AgcExports
     private const uint ComputeNumThreadZ = 0x209;
     private const uint SpiPsInputCntl0 = 0x191;
     private const uint VgtPrimitiveType = 0x242;
+    private const uint VgtIndexType = 0x243;
     private const uint PaScScreenScissorTl = 0x0C;
     private const uint PaScScreenScissorBr = 0x0D;
     private const uint CbTargetMask = 0x8E;
@@ -189,6 +203,7 @@ public static partial class AgcExports
     private const ulong ShaderNumOutputSemanticsOffset = 0x56;
     private const ulong ShaderTypeOffset = 0x5A;
     private const ulong ShaderNumShRegistersOffset = 0x5C;
+    private const uint ShaderStructSize = 0x60;
     private const ulong CommandBufferCursorUpOffset = 0x10;
     private const ulong CommandBufferCursorDownOffset = 0x18;
     private const ulong CommandBufferCallbackOffset = 0x20;
@@ -198,7 +213,6 @@ public static partial class AgcExports
     private const ulong ShaderSpecialVgtShaderStagesEnOffset = 0x08;
     private const ulong ShaderSpecialVgtGsOutPrimTypeOffset = 0x20;
     private const ulong ShaderSpecialGeUserVgprEnOffset = 0x28;
-    private const uint CbSetShRegisterRangeMarker = 0x6875000D;
     private static readonly object _submitTraceGate = new();
     private static readonly HashSet<uint> _tracedDcbSizes = new();
     private static readonly HashSet<(ulong Es, ulong Ps, GuestDrawKind Kind)> _tracedShaderTranslations = new();
@@ -286,6 +300,16 @@ public static partial class AgcExports
     private static long _labelProducerSequence;
     private static readonly object _labelProducerGate = new();
     private static readonly List<LabelProducerTrace> _labelProducers = [];
+    private const uint WorkloadStreamMinId = 1;
+    private const uint WorkloadStreamMaxId = 31;
+    private const uint WorkloadIdMax = 63;
+    private const uint WorkloadStreamRecordSize = 32;
+    private const uint WorkloadActivePacketDwords = 18;
+    private const uint WorkloadCompletePacketDwords = 12;
+    private const int Graphics5DriverErrorInvalidValue = unchecked((int)0x8A6C0033u);
+    private const int Graphics5DriverErrorInvalidArgument = unchecked((int)0x8A6C0035u);
+    private static readonly object _workloadStreamsGate = new();
+    private static readonly Dictionary<uint, byte[]> _workloadStreams = [];
     private static readonly HashSet<(object Memory, ulong Address, ulong SubmissionId)>
         _tracedProducerlessWaits = new();
     private static long _shaderTranslationMissTraceCount;
@@ -529,6 +553,8 @@ public static partial class AgcExports
              ((GcrControl >> Gl2RangeShift) & Gl2RangeMask) == 0);
     }
 
+    private sealed record BranchContinuation(ulong ResumeAddress, uint RemainingDwords);
+
     private sealed class SubmittedDcbState
     {
         public readonly record struct PendingSubmission(
@@ -554,6 +580,7 @@ public static partial class AgcExports
         public uint InstanceCount { get; set; } = 1;
         public uint DrawIndexOffset { get; set; }
         public string QueueName { get; set; } = "graphics";
+        public bool IsGraphicsQueue { get; set; }
         public ulong ActiveSubmissionId { get; set; }
         public Queue<PendingSubmission> PendingSubmissions { get; } = new();
         public bool HasActiveSubmission { get; set; }
@@ -570,6 +597,12 @@ public static partial class AgcExports
     {
         public object Gate { get; } = new();
         public SubmittedDcbState Graphics { get; } = new();
+        // A blocked graphics WAIT_REG_MEM must not keep a later graphics
+        // submission (which can be the label producer) behind it. Kyty moves
+        // the suspended batch back into its ring and runs queued work first.
+        // Keep the suspended state referenced by GpuWaitRegistry and switch
+        // new submissions to a snapshot of the command-processor state.
+        public SubmittedDcbState CurrentGraphics { get; set; } = null!;
         public Dictionary<uint, SubmittedDcbState> ComputeQueues { get; } = new();
         public Dictionary<ulong, ComputeImageWriter> ComputeImageWriters { get; } = new();
         public Dictionary<uint, string> ResourceOwners { get; } = new();
@@ -586,6 +619,12 @@ public static partial class AgcExports
         public bool WaitMonitorRunning { get; set; }
         public object WaitMonitorSignalGate { get; } = new();
         public long WaitMonitorSignalVersion { get; set; }
+
+        public SubmittedGpuState()
+        {
+            Graphics.IsGraphicsQueue = true;
+            CurrentGraphics = Graphics;
+        }
     }
 
     private readonly record struct RegisteredAgcResource(
@@ -751,7 +790,7 @@ public static partial class AgcExports
         Target = Generation.Gen5,
         LibraryName = "libSceAgc")]
     public static int SetCxRegIndirectPatchSetAddress(CpuContext ctx) =>
-        SetIndirectPatchAddress(ctx, "cx");
+        SetIndirectPatchAddress(ctx, ItSetContextRegIndirect, "cx");
 
     [SysAbiExport(
         Nid = "Qrj4c+61z4A",
@@ -759,7 +798,7 @@ public static partial class AgcExports
         Target = Generation.Gen5,
         LibraryName = "libSceAgc")]
     public static int SetShRegIndirectPatchSetAddress(CpuContext ctx) =>
-        SetIndirectPatchAddress(ctx, "sh");
+        SetIndirectPatchAddress(ctx, ItSetShRegIndirect, "sh");
 
     [SysAbiExport(
         Nid = "6lNcCp+fxi4",
@@ -767,7 +806,7 @@ public static partial class AgcExports
         Target = Generation.Gen5,
         LibraryName = "libSceAgc")]
     public static int SetUcRegIndirectPatchSetAddress(CpuContext ctx) =>
-        SetIndirectPatchAddress(ctx, "uc");
+        SetIndirectPatchAddress(ctx, ItSetUconfigRegIndirect, "uc");
 
     [SysAbiExport(
         Nid = "d-6uF9sZDIU",
@@ -775,7 +814,7 @@ public static partial class AgcExports
         Target = Generation.Gen5,
         LibraryName = "libSceAgc")]
     public static int SetCxRegIndirectPatchAddRegisters(CpuContext ctx) =>
-        AddIndirectPatchRegisters(ctx, "cx");
+        AddIndirectPatchRegisters(ctx, ItSetContextRegIndirect, "cx");
 
     [SysAbiExport(
         Nid = "z2duB-hHQSM",
@@ -783,7 +822,7 @@ public static partial class AgcExports
         Target = Generation.Gen5,
         LibraryName = "libSceAgc")]
     public static int SetShRegIndirectPatchAddRegisters(CpuContext ctx) =>
-        AddIndirectPatchRegisters(ctx, "sh");
+        AddIndirectPatchRegisters(ctx, ItSetShRegIndirect, "sh");
 
     [SysAbiExport(
         Nid = "vRoArM9zaIk",
@@ -791,7 +830,19 @@ public static partial class AgcExports
         Target = Generation.Gen5,
         LibraryName = "libSceAgc")]
     public static int SetUcRegIndirectPatchAddRegisters(CpuContext ctx) =>
-        AddIndirectPatchRegisters(ctx, "uc");
+        AddIndirectPatchRegisters(ctx, ItSetUconfigRegIndirect, "uc");
+
+    [SysAbiExport(Nid = "whb1RL7K4Ss", ExportName = "sceAgcSetCxRegIndirectPatchSetNumRegisters", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int SetCxRegIndirectPatchSetNumRegisters(CpuContext ctx) =>
+        SetIndirectPatchRegisterCount(ctx, ItSetContextRegIndirect);
+
+    [SysAbiExport(Nid = "nCUgItdN2ms", ExportName = "sceAgcSetShRegIndirectPatchSetNumRegisters", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int SetShRegIndirectPatchSetNumRegisters(CpuContext ctx) =>
+        SetIndirectPatchRegisterCount(ctx, ItSetShRegIndirect);
+
+    [SysAbiExport(Nid = "fRG-JOH5+sI", ExportName = "sceAgcSetUcRegIndirectPatchSetNumRegisters", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int SetUcRegIndirectPatchSetNumRegisters(CpuContext ctx) =>
+        SetIndirectPatchRegisterCount(ctx, ItSetUconfigRegIndirect);
 
     [SysAbiExport(
         Nid = "D9sr1xGUriE",
@@ -938,6 +989,203 @@ public static partial class AgcExports
 
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "Y3ymLfZ1384",
+        ExportName = "sceAgcUpdatePrimState",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int UpdatePrimState(CpuContext ctx)
+    {
+        var cxRegistersAddress = ctx[CpuRegister.Rdi];
+        var ucRegistersAddress = ctx[CpuRegister.Rsi];
+        var primitiveType = (uint)ctx[CpuRegister.Rdx];
+
+        // ShaderRegister is the native { uint offset; uint value; } pair.
+        // This is the in-place correction applied by Kyty after a prim-state
+        // has been created and the draw topology changes.
+        if (cxRegistersAddress != 0)
+        {
+            if (!TryReadUInt32(ctx, cxRegistersAddress + 4, out var stages) ||
+                !TryReadUInt32(ctx, cxRegistersAddress + 12, out var outputPrimitive))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+
+            if ((stages & 0x24u) == 0 &&
+                !TryWriteUInt32(ctx, cxRegistersAddress + 12,
+                    (outputPrimitive & ~0x7u) | PrimitiveTypeToGsOutput(primitiveType)))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+        }
+
+        if (ucRegistersAddress != 0)
+        {
+            if (!TryReadUInt32(ctx, ucRegistersAddress + 20, out var currentPrimitive) ||
+                !TryWriteUInt32(ctx, ucRegistersAddress + 20,
+                    (currentPrimitive & ~0x1Fu) | primitiveType))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+        }
+
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
+        Nid = "T6xuVw0KUJo",
+        ExportName = "sceAgcDebugRaiseException",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DebugRaiseException(CpuContext ctx)
+    {
+        // Kyty records the ID for diagnostics and returns success; it does
+        // not raise a host exception or change GPU state.
+        TraceAgc($"agc.debug_raise_exception id=0x{(uint)ctx[CpuRegister.Rdi]:X8}");
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
+        Nid = "dolOmWH+huQ",
+        ExportName = "sceAgcUnknownGetFusedShaderSize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int UnknownGetFusedShaderSize(CpuContext ctx)
+    {
+        var resultAddress = ctx[CpuRegister.Rdi];
+        var frontAddress = ctx[CpuRegister.Rsi];
+        var backAddress = ctx[CpuRegister.Rdx];
+        if (resultAddress == 0 || !TryGetShaderHalfTypes(ctx, frontAddress, backAddress, out _, out _) ||
+            !TryReadByte(ctx, backAddress + ShaderNumShRegistersOffset, out var backRegisterCount) ||
+            !ctx.TryWriteUInt64(resultAddress, (ulong)backRegisterCount * 8) ||
+            !ctx.TryWriteUInt64(resultAddress + 8, 4))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
+        Nid = "fd5Bp5tGTgo",
+        ExportName = "sceAgcUnknownFuseShaderHalves",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int UnknownFuseShaderHalves(CpuContext ctx)
+    {
+        var resultAddress = ctx[CpuRegister.Rdi];
+        var frontAddress = ctx[CpuRegister.Rsi];
+        var backAddress = ctx[CpuRegister.Rdx];
+        var scratchAddress = ctx[CpuRegister.Rcx];
+        if (resultAddress == 0 || frontAddress == 0 || backAddress == 0 ||
+            !TryGetShaderHalfTypes(ctx, frontAddress, backAddress, out var frontType, out _))
+        {
+            return SetReturn(ctx, unchecked((OrbisGen2Result)(int)Graphics5ErrorInvalidShaderHalves));
+        }
+
+        if (!TryReadUInt64(ctx, frontAddress + ShaderSpecialsOffset, out var frontSpecials) ||
+            !TryReadUInt64(ctx, backAddress + ShaderSpecialsOffset, out var backSpecials))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (frontSpecials != 0 && backSpecials != 0)
+        {
+            if (!TryReadUInt32(ctx, frontSpecials + ShaderSpecialVgtShaderStagesEnOffset + 4, out var frontStages) ||
+                !TryReadUInt32(ctx, backSpecials + ShaderSpecialVgtShaderStagesEnOffset + 4, out var backStages))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+
+            var mismatchBit = frontType == 4 ? 1u << 22 : 1u << 21;
+            if (((frontStages ^ backStages) & mismatchBit) != 0)
+            {
+                return SetReturn(ctx, unchecked((OrbisGen2Result)(int)Graphics5ErrorInvalidShaderHalves));
+            }
+        }
+
+        ulong fusedRegisters = 0;
+        byte fusedRegisterCount = 0;
+        if (!TryCopyGuestMemory(ctx, backAddress, resultAddress, ShaderStructSize) ||
+            !TryWriteByte(ctx, resultAddress + ShaderTypeOffset, frontType == 4 ? (byte)2 : (byte)3) ||
+            !ctx.TryWriteUInt64(resultAddress + ShaderUserDataOffset, 0) ||
+            !TryReadUInt64(ctx, resultAddress + ShaderShRegistersOffset, out fusedRegisters) ||
+            !TryReadByte(ctx, resultAddress + ShaderNumShRegistersOffset, out fusedRegisterCount))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        if (scratchAddress != 0 && fusedRegisters != 0 && fusedRegisterCount != 0)
+        {
+            if (!TryCopyGuestMemory(ctx, fusedRegisters, scratchAddress, (uint)fusedRegisterCount * 8) ||
+                !ctx.TryWriteUInt64(resultAddress + ShaderShRegistersOffset, scratchAddress))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+
+            fusedRegisters = scratchAddress;
+        }
+
+        if (!TryReadUInt64(ctx, frontAddress + ShaderShRegistersOffset, out var frontRegisters) ||
+            !TryReadByte(ctx, frontAddress + ShaderNumShRegistersOffset, out var frontRegisterCount) ||
+            !TryReadUInt64(ctx, frontAddress + ShaderCodeOffset, out var frontCode) ||
+            !PatchFusedShaderRegisters(ctx, fusedRegisters, fusedRegisterCount, frontRegisters, frontRegisterCount, frontCode, frontType))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
+        Nid = "s+VGAMDQ0AQ",
+        ExportName = "sceAgcGetDataPacketPayloadRange",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int GetDataPacketPayloadRange(CpuContext ctx)
+    {
+        var rangeAddress = ctx[CpuRegister.Rdi];
+        var commandAddress = ctx[CpuRegister.Rsi];
+        var type = (int)ctx[CpuRegister.Rdx];
+        if (rangeAddress == 0 || commandAddress == 0)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        if (!TryReadUInt32(ctx, commandAddress, out var header))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        // MemoryRange is { void* base; uint64_t size; }. This mirrors Kyty's
+        // packet-length bit arithmetic exactly, including the 0x3fff sentinel.
+        ulong payloadAddress;
+        ulong payloadSize;
+        if (type != 0)
+        {
+            payloadAddress = commandAddress + 8;
+            payloadSize = (header >> 14) & 0xFFFCu;
+        }
+        else if ((~header & 0x3FFF_0000u) == 0)
+        {
+            payloadAddress = 0;
+            payloadSize = 0;
+        }
+        else
+        {
+            payloadAddress = commandAddress + 4;
+            payloadSize = ((header >> 14) & 0xFFFCu) + sizeof(uint);
+        }
+
+        if (!ctx.TryWriteUInt64(rangeAddress, payloadAddress) ||
+            !ctx.TryWriteUInt64(rangeAddress + sizeof(ulong), payloadSize))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
     #pragma warning restore SHEM004
 
@@ -1086,7 +1334,8 @@ public static partial class AgcExports
     public static int AcbResetQueue(CpuContext ctx)
     {
         var commandBufferAddress = ctx[CpuRegister.Rdi];
-        if (commandBufferAddress == 0 ||
+        var operation = (uint)ctx[CpuRegister.Rsi];
+        if (commandBufferAddress == 0 || (operation & ~0x1C2u) != 0 ||
             !TryAllocateCommandDwords(ctx, commandBufferAddress, 2, out var commandAddress) ||
             !TryWriteUInt32(ctx, commandAddress, Pm4(2, ItNop, RAcbReset)) ||
             !TryWriteUInt32(ctx, commandAddress + 4, 0))
@@ -1102,34 +1351,7 @@ public static partial class AgcExports
         ExportName = "sceAgcAcbEventWrite",
         Target = Generation.Gen5,
         LibraryName = "libSceAgc")]
-    public static int AcbEventWrite(CpuContext ctx)
-    {
-        var commandBufferAddress = ctx[CpuRegister.Rdi];
-        var eventType = (uint)(ctx[CpuRegister.Rsi] & 0xFF);
-        var eventAddress = ctx[CpuRegister.Rdx];
-        if (commandBufferAddress == 0 || eventType >= 0x40)
-        {
-            return ReturnPointer(ctx, 0);
-        }
-
-        var hasAddress = (eventType & ~1u) == 0x38;
-        var packetDwords = hasAddress ? 4u : 2u;
-        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, packetDwords, out var commandAddress) ||
-            !TryWriteUInt32(ctx, commandAddress, Pm4(packetDwords, ItEventWrite, 0)) ||
-            !TryWriteUInt32(ctx, commandAddress + 4, hasAddress ? eventType | 0x100u : eventType & 0x3Fu))
-        {
-            return ReturnPointer(ctx, 0);
-        }
-
-        if (hasAddress &&
-            (!TryWriteUInt32(ctx, commandAddress + 8, (uint)eventAddress & ~7u) ||
-             !TryWriteUInt32(ctx, commandAddress + 12, (uint)(eventAddress >> 32))))
-        {
-            return ReturnPointer(ctx, 0);
-        }
-
-        return ReturnPointer(ctx, commandAddress);
-    }
+    public static int AcbEventWrite(CpuContext ctx) => DcbEventWrite(ctx);
 
     [SysAbiExport(
         Nid = "KT-hTp-Ch14",
@@ -1266,17 +1488,14 @@ public static partial class AgcExports
         var offset = (uint)ctx[CpuRegister.Rsi];
         var valuesAddress = ctx[CpuRegister.Rdx];
         var valueCount = (uint)ctx[CpuRegister.Rcx];
-        if (commandBufferAddress == 0 || offset == 0 || offset > 0x3FF || valueCount == 0)
+        if (commandBufferAddress == 0 || valueCount > 0x3FFF)
         {
             return ReturnPointer(ctx, 0);
         }
 
-        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 2, out var markerAddress) ||
-            !TryWriteUInt32(ctx, markerAddress, Pm4(2, ItNop, RZero)) ||
-            !TryWriteUInt32(ctx, markerAddress + 4, CbSetShRegisterRangeMarker) ||
-            !TryAllocateCommandDwords(ctx, commandBufferAddress, valueCount + 2, out var commandAddress) ||
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, valueCount + 2, out var commandAddress) ||
             !TryWriteUInt32(ctx, commandAddress, Pm4(valueCount + 2, ItSetShReg, 0)) ||
-            !TryWriteUInt32(ctx, commandAddress + 4, offset))
+            !TryWriteUInt32(ctx, commandAddress + 4, offset & 0xFFFFu))
         {
             return ReturnPointer(ctx, 0);
         }
@@ -1371,14 +1590,14 @@ public static partial class AgcExports
         var commandBufferAddress = ctx[CpuRegister.Rdi];
         var op = (uint)ctx[CpuRegister.Rsi];
         var state = (uint)ctx[CpuRegister.Rdx];
-        if (commandBufferAddress == 0 || op != 0x3FF || state != 0)
+        if (commandBufferAddress == 0 || (op & ~0xFFFu) != 0)
         {
             return ReturnPointer(ctx, 0);
         }
 
         if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 2, out var commandAddress) ||
-            !TryWriteUInt32(ctx, commandAddress, Pm4(2, ItNop, RDrawReset)) ||
-            !TryWriteUInt32(ctx, commandAddress + 4, 0))
+            !TryWriteUInt32(ctx, commandAddress, Pm4(2, ItClearState, 0)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, state & 0xFu))
         {
             return ReturnPointer(ctx, 0);
         }
@@ -1393,7 +1612,7 @@ public static partial class AgcExports
         Target = Generation.Gen5,
         LibraryName = "libSceAgc")]
     public static int DcbSetCxRegistersIndirect(CpuContext ctx) =>
-        DcbSetRegistersIndirect(ctx, RCxRegsIndirect, "cx");
+        DcbSetRegistersIndirect(ctx, ItSetContextRegIndirect, "cx");
 
     [SysAbiExport(
         Nid = "-HOOCn0JY48",
@@ -1401,7 +1620,7 @@ public static partial class AgcExports
         Target = Generation.Gen5,
         LibraryName = "libSceAgc")]
     public static int DcbSetShRegistersIndirect(CpuContext ctx) =>
-        DcbSetRegistersIndirect(ctx, RShRegsIndirect, "sh");
+        DcbSetRegistersIndirect(ctx, ItSetShRegIndirect, "sh");
 
     [SysAbiExport(
         Nid = "hvUfkUIQcOE",
@@ -1409,7 +1628,7 @@ public static partial class AgcExports
         Target = Generation.Gen5,
         LibraryName = "libSceAgc")]
     public static int DcbSetUcRegistersIndirect(CpuContext ctx) =>
-        DcbSetRegistersIndirect(ctx, RUcRegsIndirect, "uc");
+        DcbSetRegistersIndirect(ctx, ItSetUconfigRegIndirect, "uc");
 
     [SysAbiExport(
         Nid = "GIIW2J37e70",
@@ -1421,14 +1640,16 @@ public static partial class AgcExports
         var commandBufferAddress = ctx[CpuRegister.Rdi];
         var indexSize = (uint)(ctx[CpuRegister.Rsi] & 0xFF);
         var cachePolicy = (uint)(ctx[CpuRegister.Rdx] & 0xFF);
-        if (commandBufferAddress == 0 || cachePolicy != 0)
+        if (commandBufferAddress == 0)
         {
             return ReturnPointer(ctx, 0);
         }
 
-        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 2, out var commandAddress) ||
-            !TryWriteUInt32(ctx, commandAddress, Pm4(2, ItIndexType, 0)) ||
-            !TryWriteUInt32(ctx, commandAddress + 4, indexSize))
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 3, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(3, ItSetUconfigRegIndex, 0)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, 0x2000_0000u | VgtIndexType) ||
+            !TryWriteUInt32(ctx, commandAddress + 8,
+                0x400u | (indexSize & 3u) | ((cachePolicy & 3u) << 6)))
         {
             return ReturnPointer(ctx, 0);
         }
@@ -1448,7 +1669,7 @@ public static partial class AgcExports
         var indexCount = (uint)ctx[CpuRegister.Rsi];
         if (commandBufferAddress == 0 ||
             !TryAllocateCommandDwords(ctx, commandBufferAddress, 2, out var commandAddress) ||
-            !TryWriteUInt32(ctx, commandAddress, Pm4(2, ItNop, RIndexCount)) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(2, ItIndexBufferSize, 0)) ||
             !TryWriteUInt32(ctx, commandAddress + 4, indexCount))
         {
             return ReturnPointer(ctx, 0);
@@ -1464,8 +1685,197 @@ public static partial class AgcExports
         LibraryName = "libSceAgc")]
     public static int DcbSetIndexCountGetSize(CpuContext ctx)
     {
-        ctx[CpuRegister.Rax] = 7u * sizeof(uint);
-        return (int)ctx[CpuRegister.Rax];
+        return ReturnSize(ctx, 2u * sizeof(uint));
+    }
+
+    // Exact PM4 byte counts from Kyty's libGraphicsDriver command builders.
+    [SysAbiExport(Nid = "6DFuRKT4C9w", ExportName = "sceAgcDcbSetNumInstancesGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbSetNumInstancesGetSize(CpuContext ctx) => ReturnSize(ctx, 8);
+
+    [SysAbiExport(Nid = "6ee9Hd3EWXQ", ExportName = "sceAgcDcbDrawIndexGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbDrawIndexGetSize(CpuContext ctx) => ReturnSize(ctx, 24);
+
+    [SysAbiExport(Nid = "mR9j7+SfM34", ExportName = "sceAgcDcbDrawIndexMultiInstancedGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbDrawIndexMultiInstancedGetSize(CpuContext ctx) => ReturnSize(ctx, 36);
+
+    [SysAbiExport(Nid = "w8HVkEeXPv8", ExportName = "sceAgcDcbDispatchIndirectGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbDispatchIndirectGetSize(CpuContext ctx) => ReturnSize(ctx, 12);
+
+    [SysAbiExport(Nid = "t7PlZ9nt5Lc", ExportName = "sceAgcCbNopGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int CbNopGetSize(CpuContext ctx) =>
+        ReturnSize(ctx, unchecked(4u * (uint)ctx[CpuRegister.Rdi]));
+
+    [SysAbiExport(Nid = "Abendgtz+3o", ExportName = "sceAgcCbDispatchGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int CbDispatchGetSize(CpuContext ctx) => ReturnSize(ctx, 20);
+
+    [SysAbiExport(Nid = "bxGoVxpdSPQ", ExportName = "sceAgcCbSetShRegisterRangeDirectGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int CbSetShRegisterRangeDirectGetSize(CpuContext ctx) =>
+        ReturnSize(ctx, unchecked((4u * (uint)ctx[CpuRegister.Rdi]) + 8u));
+
+    [SysAbiExport(Nid = "cxPZ4Wgvdj8", ExportName = "sceAgcDcbDrawIndirectGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbDrawIndirectGetSize(CpuContext ctx) => ReturnSize(ctx, 20);
+
+    [SysAbiExport(Nid = "-vnlTPPXPrw", ExportName = "sceAgcDcbAcquireMemGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbAcquireMemGetSize(CpuContext ctx) => ReturnSize(ctx, 32);
+
+    [SysAbiExport(Nid = "ewobAQeMo5k", ExportName = "sceAgcAcbAcquireMemGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int AcbAcquireMemGetSize(CpuContext ctx) => ReturnSize(ctx, 32);
+
+    [SysAbiExport(Nid = "ou16V5hh5sg", ExportName = "sceAgcDcbCondExecGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbCondExecGetSize(CpuContext ctx) => ReturnSize(ctx, 20);
+
+    [SysAbiExport(Nid = "ozKzBP4aki4", ExportName = "sceAgcAcbCondExecGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int AcbCondExecGetSize(CpuContext ctx) => ReturnSize(ctx, 20);
+
+    [SysAbiExport(Nid = "VEGu4dixjUg", ExportName = "sceAgcDcbJumpGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbJumpGetSize(CpuContext ctx) => ReturnSize(ctx, 16);
+
+    [SysAbiExport(Nid = "b-oySn+G2tE", ExportName = "sceAgcAcbJumpGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int AcbJumpGetSize(CpuContext ctx) => ReturnSize(ctx, 16);
+
+    [SysAbiExport(Nid = "QIXCsbipds0", ExportName = "sceAgcDcbRewindGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbRewindGetSize(CpuContext ctx) => ReturnSize(ctx, 8);
+
+    [SysAbiExport(Nid = "p9tI+yTvx68", ExportName = "sceAgcDcbWriteDataGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbWriteDataGetSize(CpuContext ctx) =>
+        ReturnSize(ctx, unchecked((4u * (uint)ctx[CpuRegister.Rdi]) + 16u));
+
+    [SysAbiExport(Nid = "43WJ08sSugE", ExportName = "sceAgcDcbWaitOnAddressGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbWaitOnAddressGetSize(CpuContext ctx) =>
+        ReturnSize(ctx, (uint)ctx[CpuRegister.Rdi] switch { 0 => 56, 1 => 64, _ => 0 });
+
+    [SysAbiExport(Nid = "hL7C0IRpWZI", ExportName = "sceAgcCbQueueEndOfPipeActionGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int CbQueueEndOfPipeActionGetSize(CpuContext ctx) => ReturnSize(ctx, 32);
+
+    [SysAbiExport(Nid = "1DeUNpRIDDA", ExportName = "sceAgcDcbSetCxRegisterDirectGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbSetCxRegisterDirectGetSize(CpuContext ctx) => ReturnSize(ctx, 12);
+
+    [SysAbiExport(Nid = "WrdP9Zxx3lQ", ExportName = "sceAgcDcbDrawIndexAutoGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbDrawIndexAutoGetSize(CpuContext ctx) => ReturnSize(ctx, 12);
+
+    [SysAbiExport(Nid = "qMlfB1ZhMDc", ExportName = "sceAgcDcbDrawIndexOffsetGetSize", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbDrawIndexOffsetGetSize(CpuContext ctx) => ReturnSize(ctx, 20);
+
+    [SysAbiExport(Nid = "pFLArOT53+w", ExportName = "sceAgcDcbSetShRegisterDirect", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbSetShRegisterDirect(CpuContext ctx) =>
+        DcbSetRegisterDirect(ctx, ItSetShReg, "sh");
+
+    [SysAbiExport(Nid = "LHFXRrlTPD8", ExportName = "sceAgcDcbSetCxRegisterDirect", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbSetCxRegisterDirect(CpuContext ctx) =>
+        DcbSetRegisterDirect(ctx, ItSetContextReg, "cx");
+
+    [SysAbiExport(Nid = "w4-d0n60hdo", ExportName = "sceAgcDcbSetUcRegisterDirect", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbSetUcRegisterDirect(CpuContext ctx) =>
+        DcbSetRegisterDirect(ctx, ItSetUconfigReg, "uc");
+
+    [SysAbiExport(Nid = "1q1titRBL6o", ExportName = "sceAgcDcbDrawIndirect", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbDrawIndirect(CpuContext ctx) =>
+        DcbDrawIndirectCore(ctx, ItDrawIndirect, indexed: false);
+
+    [SysAbiExport(Nid = "ypVBz4uPKcQ", ExportName = "sceAgcDcbDrawIndexIndirectMulti", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbDrawIndexIndirectMulti(CpuContext ctx)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var dataOffset = (uint)ctx[CpuRegister.Rsi];
+        var countIndirect = (uint)ctx[CpuRegister.Rdx];
+        var maxCount = (uint)ctx[CpuRegister.Rcx];
+        var countAddress = ctx[CpuRegister.R8];
+        var stride = (uint)ctx[CpuRegister.R9];
+        var stackAddress = ctx[CpuRegister.Rsp];
+        if (!TryReadUInt64(ctx, stackAddress + 8, out var modifier) ||
+            commandBufferAddress == 0 || (countIndirect & ~1u) != 0)
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        var patchOffsets = DecodeIndirectModifierPatchOffsets(modifier, indexed: true);
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 10, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(10, ItDrawIndexIndirectMulti, 0)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, dataOffset) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, (uint)patchOffsets) ||
+            !TryWriteUInt32(ctx, commandAddress + 12, (uint)(patchOffsets >> 32)) ||
+            !TryWriteUInt32(ctx, commandAddress + 16, countIndirect << 30) ||
+            !TryWriteUInt32(ctx, commandAddress + 20, maxCount) ||
+            !TryWriteUInt32(ctx, commandAddress + 24, (uint)countAddress & 0xFFFF_FFFCu) ||
+            !TryWriteUInt32(ctx, commandAddress + 28, (uint)(countAddress >> 32)) ||
+            !TryWriteUInt32(ctx, commandAddress + 32, stride) ||
+            !TryWriteUInt32(ctx, commandAddress + 36, DecodeIndirectDrawInitiator(modifier)))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    [SysAbiExport(
+        Nid = "w1KFAHVqpaU",
+        ExportName = "sceAgcCbBranch",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int CbBranch(CpuContext ctx)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var mode = (uint)ctx[CpuRegister.Rsi];
+        var compareFunction = (uint)ctx[CpuRegister.Rdx];
+        var compareAddress = ctx[CpuRegister.Rcx];
+        var mask = ctx[CpuRegister.R8];
+        var reference = ctx[CpuRegister.R9];
+        var stackAddress = ctx[CpuRegister.Rsp];
+        if (!TryReadUInt64(ctx, stackAddress + 8, out var cachePolicy1) ||
+            !TryReadUInt64(ctx, stackAddress + 16, out var thenAddress) ||
+            !TryReadUInt64(ctx, stackAddress + 24, out var thenDwordCount) ||
+            !TryReadUInt64(ctx, stackAddress + 32, out var cachePolicy2) ||
+            !TryReadUInt64(ctx, stackAddress + 40, out var elseAddress) ||
+            !TryReadUInt64(ctx, stackAddress + 48, out var elseDwordCount) ||
+            commandBufferAddress == 0 ||
+            !TryAllocateCommandDwords(ctx, commandBufferAddress, 14, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(14, ItIndirectBuffer, 0)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, (mode & 3u) | ((compareFunction & 7u) << 8)) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, (uint)compareAddress & 0xFFFF_FFF8u) ||
+            !TryWriteUInt32(ctx, commandAddress + 12, (uint)(compareAddress >> 32)) ||
+            !TryWriteUInt32(ctx, commandAddress + 16, (uint)mask) ||
+            !TryWriteUInt32(ctx, commandAddress + 20, (uint)(mask >> 32)) ||
+            !TryWriteUInt32(ctx, commandAddress + 24, (uint)reference) ||
+            !TryWriteUInt32(ctx, commandAddress + 28, (uint)(reference >> 32)) ||
+            !TryWriteUInt32(ctx, commandAddress + 32, (uint)thenAddress & 0xFFFF_FFFCu) ||
+            !TryWriteUInt32(ctx, commandAddress + 36, (uint)(thenAddress >> 32)) ||
+            !TryWriteUInt32(ctx, commandAddress + 40, ((uint)thenDwordCount & 0xFFFFFu) | ((uint)cachePolicy1 & 3u) << 28) ||
+            !TryWriteUInt32(ctx, commandAddress + 44, (uint)elseAddress & 0xFFFF_FFFCu) ||
+            !TryWriteUInt32(ctx, commandAddress + 48, (uint)(elseAddress >> 32)) ||
+            !TryWriteUInt32(ctx, commandAddress + 52, ((uint)elseDwordCount & 0xFFFFFu) | ((uint)cachePolicy2 & 3u) << 28))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    [SysAbiExport(Nid = "BIPexNBSGog", ExportName = "sceAgcDcbCondExec", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbCondExec(CpuContext ctx) => DcbCondExecCore(ctx);
+
+    [SysAbiExport(Nid = "qyM2bxYFPAk", ExportName = "sceAgcAcbCondExec", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int AcbCondExec(CpuContext ctx) => DcbCondExecCore(ctx);
+
+    [SysAbiExport(Nid = "1rZSWUv1IRc", ExportName = "sceAgcDcbCopyData", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbCopyData(CpuContext ctx) => DcbCopyDataCore(ctx, acbSourceEncoding: false);
+
+    [SysAbiExport(Nid = "qzMN2XKGA4k", ExportName = "sceAgcAcbCopyData", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int AcbCopyData(CpuContext ctx) => DcbCopyDataCore(ctx, acbSourceEncoding: true);
+
+    [SysAbiExport(Nid = "zfcxg-ewMK8", ExportName = "sceAgcDcbRewind", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int DcbRewind(CpuContext ctx)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var initialState = (uint)ctx[CpuRegister.Rsi];
+        if (commandBufferAddress == 0 ||
+            !TryAllocateCommandDwords(ctx, commandBufferAddress, 2, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(2, ItRewind, 0)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, (initialState & 1u) << 31))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        return ReturnPointer(ctx, commandAddress);
     }
 
     [SysAbiExport(
@@ -1503,45 +1913,65 @@ public static partial class AgcExports
         var commandBufferAddress = ctx[CpuRegister.Rdi];
         var indexCount = (uint)ctx[CpuRegister.Rsi];
         var indexAddress = ctx[CpuRegister.Rdx];
-        var modifier = (uint)ctx[CpuRegister.Rcx];
+        var modifier = ctx[CpuRegister.Rcx];
 
-        if (commandBufferAddress == 0 || modifier != 0x4000_0000)
+        if (commandBufferAddress == 0 || indexAddress == 0 || (indexAddress & 1) != 0)
         {
             return ReturnPointer(ctx, 0);
         }
 
-        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 5, out var baseCommand) ||
-            !TryWriteUInt32(ctx, baseCommand, Pm4(3, ItIndexBase, 0)) ||
-            !TryWriteUInt32(ctx, baseCommand + 4, (uint)indexAddress) ||
-            !TryWriteUInt32(ctx, baseCommand + 8, (uint)(indexAddress >> 32)) ||
-            !TryWriteUInt32(ctx, baseCommand + 12, Pm4(2, ItIndexBufferSize, 0)) ||
-            !TryWriteUInt32(ctx, baseCommand + 16, indexCount))
-        {
-            return ReturnPointer(ctx, 0);
-        }
-
-        // DRAW_INDEX_2 is six dwords: header, maximum index count, the
-        // 64-bit index-buffer base, the draw count and the initiator.  The
-        // former five-dword packet omitted both the real base and the count
-        // field, so every call made by Unity looked like a zero-count draw to
-        // the submitted-command parser and the complete scene was discarded.
         if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 6, out var drawCommand) ||
             !TryWriteUInt32(ctx, drawCommand, Pm4(6, ItDrawIndex2, 0)) ||
-            !TryWriteUInt32(ctx, drawCommand + 4, indexCount) ||
+            !TryWriteUInt32(ctx, drawCommand + 4, indexCount == 0 ? 1u : indexCount) ||
             !TryWriteUInt32(ctx, drawCommand + 8, (uint)indexAddress) ||
             !TryWriteUInt32(ctx, drawCommand + 12, (uint)(indexAddress >> 32)) ||
             !TryWriteUInt32(ctx, drawCommand + 16, indexCount) ||
-            !TryWriteUInt32(ctx, drawCommand + 20, 0))
+            !TryWriteUInt32(ctx, drawCommand + 20, DecodeDrawIndexInitiator(modifier)))
         {
             return ReturnPointer(ctx, 0);
         }
 
         TraceAgc(
             $"agc.dcb_draw_index buf=0x{commandBufferAddress:X16} " +
-            $"base=0x{baseCommand:X16} draw=0x{drawCommand:X16} " +
+            $"draw=0x{drawCommand:X16} " +
             $"count={indexCount} index=0x{indexAddress:X16}");
 
         return ReturnPointer(ctx, drawCommand);
+    }
+
+    [SysAbiExport(
+        Nid = "Rlx+bykm0r0",
+        ExportName = "sceAgcDcbDrawIndexMultiInstanced",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbDrawIndexMultiInstanced(CpuContext ctx)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var indexCount = (uint)ctx[CpuRegister.Rsi];
+        var indexAddress = ctx[CpuRegister.Rdx];
+        var objectIdsAddress = ctx[CpuRegister.Rcx];
+        var instanceCount = (uint)ctx[CpuRegister.R8];
+        var modifier = ctx[CpuRegister.R9];
+        if (commandBufferAddress == 0 || indexAddress == 0 || objectIdsAddress == 0 || (indexAddress & 1) != 0)
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 9, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(9, ItDispatchDrawPreamble, 0)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, indexCount) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, (uint)indexAddress) ||
+            !TryWriteUInt32(ctx, commandAddress + 12, (uint)(indexAddress >> 32)) ||
+            !TryWriteUInt32(ctx, commandAddress + 16, instanceCount == 0 ? 1u : instanceCount) ||
+            !TryWriteUInt32(ctx, commandAddress + 20, (uint)objectIdsAddress) ||
+            !TryWriteUInt32(ctx, commandAddress + 24, (uint)(objectIdsAddress >> 32)) ||
+            !TryWriteUInt32(ctx, commandAddress + 28, instanceCount) ||
+            !TryWriteUInt32(ctx, commandAddress + 32, DecodeDrawIndexInitiator(modifier) | 0x80u))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        return ReturnPointer(ctx, commandAddress);
     }
 
     [SysAbiExport(
@@ -1554,19 +1984,15 @@ public static partial class AgcExports
         var commandBufferAddress = ctx[CpuRegister.Rdi];
         var indexCount = (uint)ctx[CpuRegister.Rsi];
         var modifier = ctx[CpuRegister.Rdx];
-        if (commandBufferAddress == 0 || modifier != 0x4000_0000)
+        if (commandBufferAddress == 0)
         {
             return ReturnPointer(ctx, 0);
         }
 
-        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 7, out var commandAddress) ||
-            !TryWriteUInt32(ctx, commandAddress, Pm4(7, ItNop, RDrawIndexAuto)) ||
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 3, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(3, ItDrawIndexAuto, 0)) ||
             !TryWriteUInt32(ctx, commandAddress + 4, indexCount) ||
-            !TryWriteUInt32(ctx, commandAddress + 8, 0) ||
-            !TryWriteUInt32(ctx, commandAddress + 12, 0) ||
-            !TryWriteUInt32(ctx, commandAddress + 16, 0) ||
-            !TryWriteUInt32(ctx, commandAddress + 20, 0) ||
-            !TryWriteUInt32(ctx, commandAddress + 24, 0))
+            !TryWriteUInt32(ctx, commandAddress + 8, DecodeDrawIndexInitiator(modifier) | 2u))
         {
             return ReturnPointer(ctx, 0);
         }
@@ -1582,24 +2008,7 @@ public static partial class AgcExports
         LibraryName = "libSceAgc")]
     public static int DcbDrawIndexIndirect(CpuContext ctx)
     {
-        var commandBufferAddress = ctx[CpuRegister.Rdi];
-        var dataOffset = (uint)ctx[CpuRegister.Rsi];
-        var modifier = (uint)ctx[CpuRegister.Rdx];
-        if (commandBufferAddress == 0 ||
-            !TryAllocateCommandDwords(ctx, commandBufferAddress, 5, out var commandAddress) ||
-            !TryWriteUInt32(ctx, commandAddress, Pm4(5, ItDrawIndexIndirect, 0)) ||
-            !TryWriteUInt32(ctx, commandAddress + 4, dataOffset) ||
-            !TryWriteUInt32(ctx, commandAddress + 8, 0) ||
-            !TryWriteUInt32(ctx, commandAddress + 12, 0) ||
-            !TryWriteUInt32(ctx, commandAddress + 16, modifier))
-        {
-            return ReturnPointer(ctx, 0);
-        }
-
-        TraceAgc(
-            $"agc.dcb_draw_index_indirect buf=0x{commandBufferAddress:X16} " +
-            $"cmd=0x{commandAddress:X16} offset=0x{dataOffset:X8} modifier=0x{modifier:X8}");
-        return ReturnPointer(ctx, commandAddress);
+        return DcbDrawIndirectCore(ctx, ItDrawIndexIndirect, indexed: true);
     }
 
     [SysAbiExport(
@@ -1679,14 +2088,20 @@ public static partial class AgcExports
         var commandBufferAddress = ctx[CpuRegister.Rdi];
         var eventType = (uint)(ctx[CpuRegister.Rsi] & 0xFF);
         var eventAddress = ctx[CpuRegister.Rdx];
-        if (commandBufferAddress == 0 || eventType > 0x3F || eventAddress != 0)
+        if (commandBufferAddress == 0 || eventType > 0x3F)
         {
             return ReturnPointer(ctx, 0);
         }
 
-        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 2, out var commandAddress) ||
-            !TryWriteUInt32(ctx, commandAddress, Pm4(2, ItEventWrite, 0)) ||
-            !TryWriteUInt32(ctx, commandAddress + 4, eventType))
+        var addressedEvent = (eventType & 0xFEu) == 0x38u;
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, addressedEvent ? 4u : 2u, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(addressedEvent ? 4u : 2u, ItEventWrite, 0)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, eventType is 7 or 15 or 16
+                ? 0x400u | eventType
+                : addressedEvent ? 0x100u | eventType : eventType & 0x3Fu) ||
+            (addressedEvent &&
+             (!TryWriteUInt32(ctx, commandAddress + 8, (uint)eventAddress & 0xFFFF_FFF8u) ||
+              !TryWriteUInt32(ctx, commandAddress + 12, (uint)(eventAddress >> 32)))))
         {
             return ReturnPointer(ctx, 0);
         }
@@ -2143,6 +2558,20 @@ public static partial class AgcExports
     public static int AcbPushMarker(CpuContext ctx) => DcbPushMarker(ctx);
 
     [SysAbiExport(
+        Nid = "QhCbS4X9Rl8",
+        ExportName = "sceAgcDcbSetMarker",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbSetMarker(CpuContext ctx) => DcbPushMarker(ctx);
+
+    [SysAbiExport(
+        Nid = "xAeBOa0A3kk",
+        ExportName = "sceAgcAcbSetMarker",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int AcbSetMarker(CpuContext ctx) => DcbPushMarker(ctx);
+
+    [SysAbiExport(
         Nid = "H7uZqCoNuWk",
         ExportName = "sceAgcDcbPopMarker",
         Target = Generation.Gen5,
@@ -2167,6 +2596,30 @@ public static partial class AgcExports
         Target = Generation.Gen5,
         LibraryName = "libSceAgc")]
     public static int AcbPopMarker(CpuContext ctx) => DcbPopMarker(ctx);
+
+    [SysAbiExport(
+        Nid = "ziVA3whp3p4",
+        ExportName = "sceAgcRewindPatchSetRewindState",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int RewindPatchSetRewindState(CpuContext ctx)
+    {
+        var packetAddress = ctx[CpuRegister.Rdi];
+        var state = (uint)ctx[CpuRegister.Rsi];
+        if (packetAddress != 0 &&
+            TryReadUInt32(ctx, packetAddress + sizeof(uint), out var control) &&
+            TryWriteUInt32(ctx, packetAddress + sizeof(uint),
+                (control & ~0x8000_0000u) | ((state & 1u) << 31)))
+        {
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        // Kyty exposes this as a void patch helper and silently ignores a null
+        // packet; preserve that observable ABI behavior on invalid guest memory.
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
 
     [SysAbiExport(
         Nid = "IxYiarKlXxM",
@@ -2223,6 +2676,56 @@ public static partial class AgcExports
             ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK)
             : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
     }
+
+    [SysAbiExport(
+        Nid = "2BS4EtAaF28",
+        ExportName = "sceAgcJumpPatchSetTarget",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int JumpPatchSetTarget(CpuContext ctx) => PatchJumpTarget(ctx);
+
+    [SysAbiExport(
+        Nid = "bxca0BK4FNg",
+        ExportName = "sceAgcUnknownJumpPatchSetTarget",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int UnknownJumpPatchSetTarget(CpuContext ctx) => PatchJumpTarget(ctx);
+
+    // Public SDK name is not known; the NID and behavior are taken directly
+    // from Kyty's GraphicsUnknownIkfdtRIqCE implementation.
+    #pragma warning disable SHEM006
+    [SysAbiExport(
+        Nid = "Ikfdt-rIqCE",
+        ExportName = "sceAgcUnknownIkfdtRIqCE",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int UnknownIkfdtRIqCE(CpuContext ctx)
+    {
+        var commandAddress = ctx[CpuRegister.Rdi];
+        var cachePolicy = (uint)ctx[CpuRegister.Rsi] & 3u;
+        var targetAddress = ctx[CpuRegister.Rdx];
+        var dwordCount = (uint)ctx[CpuRegister.Rcx];
+        if (!TryReadUInt32(ctx, commandAddress, out var header) ||
+            ((header >> 8) & 0xFFu) != ItIndirectBuffer ||
+            !TryReadUInt32(ctx, commandAddress + 4, out var addressLow) ||
+            !TryReadUInt32(ctx, commandAddress + 12, out var sizeAndControl))
+        {
+            ctx[CpuRegister.Rax] = Graphics5ErrorInvalidPacket;
+            return unchecked((int)Graphics5ErrorInvalidPacket);
+        }
+
+        if (!TryWriteUInt32(ctx, commandAddress + 4,
+                (addressLow & 3u) | (uint)targetAddress & 0xFFFF_FFFCu) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, (uint)(targetAddress >> 32)) ||
+            !TryWriteUInt32(ctx, commandAddress + 12,
+                (sizeAndControl & 0xCFF0_0000u) | (cachePolicy << 28) | (dwordCount & 0x000F_FFFFu)))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+    #pragma warning restore SHEM006
 
     [SysAbiExport(
         Nid = "eAy8eGNsCuU",
@@ -2519,23 +3022,20 @@ public static partial class AgcExports
     {
         var commandBufferAddress = ctx[CpuRegister.Rdi];
         var indexBufferAddress = ctx[CpuRegister.Rsi];
-        var indexCount = (uint)ctx[CpuRegister.Rdx];
-        if (commandBufferAddress == 0)
+        if (commandBufferAddress == 0 || (indexBufferAddress & 1) != 0)
         {
             return ReturnPointer(ctx, 0);
         }
 
-        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 5, out var commandAddress) ||
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 3, out var commandAddress) ||
             !TryWriteUInt32(ctx, commandAddress, Pm4(3, ItIndexBase, 0)) ||
             !TryWriteUInt32(ctx, commandAddress + 4, (uint)(indexBufferAddress & 0xFFFF_FFFFUL)) ||
-            !TryWriteUInt32(ctx, commandAddress + 8, (uint)(indexBufferAddress >> 32)) ||
-            !TryWriteUInt32(ctx, commandAddress + 12, Pm4(2, ItIndexBufferSize, 0)) ||
-            !TryWriteUInt32(ctx, commandAddress + 16, indexCount))
+            !TryWriteUInt32(ctx, commandAddress + 8, (uint)(indexBufferAddress >> 32)))
         {
             return ReturnPointer(ctx, 0);
         }
 
-        TraceAgc($"agc.dcb_set_index_buffer buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} addr=0x{indexBufferAddress:X16} count={indexCount}");
+        TraceAgc($"agc.dcb_set_index_buffer buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} addr=0x{indexBufferAddress:X16}");
         return ReturnPointer(ctx, commandAddress);
     }
 
@@ -2549,7 +3049,7 @@ public static partial class AgcExports
         var commandBufferAddress = ctx[CpuRegister.Rdi];
         var indexOffset = (uint)ctx[CpuRegister.Rsi];
         var indexCount = (uint)ctx[CpuRegister.Rdx];
-        var flags = (uint)ctx[CpuRegister.Rcx];
+        var modifier = ctx[CpuRegister.Rcx];
         if (commandBufferAddress == 0)
         {
             return ReturnPointer(ctx, 0);
@@ -2557,15 +3057,15 @@ public static partial class AgcExports
 
         if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 5, out var commandAddress) ||
             !TryWriteUInt32(ctx, commandAddress, Pm4(5, ItDrawIndexOffset2, 0)) ||
-            !TryWriteUInt32(ctx, commandAddress + 4, indexCount) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, indexCount == 0 ? 1u : indexCount) ||
             !TryWriteUInt32(ctx, commandAddress + 8, indexOffset) ||
             !TryWriteUInt32(ctx, commandAddress + 12, indexCount) ||
-            !TryWriteUInt32(ctx, commandAddress + 16, flags & 0xE000_0001u))
+            !TryWriteUInt32(ctx, commandAddress + 16, DecodeDrawIndexInitiator(modifier)))
         {
             return ReturnPointer(ctx, 0);
         }
 
-        TraceAgc($"agc.dcb_draw_index_offset buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} offset={indexOffset} count={indexCount} flags=0x{flags:X8}");
+        TraceAgc($"agc.dcb_draw_index_offset buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} offset={indexOffset} count={indexCount} modifier=0x{modifier:X16}");
         return ReturnPointer(ctx, commandAddress);
     }
 
@@ -2630,6 +3130,130 @@ public static partial class AgcExports
 
         TraceAgc($"agc.dcb_set_flip buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} handle={videoOutHandle} index={displayBufferIndex} mode={flipMode} arg=0x{flipArg:X16}");
         return ReturnPointer(ctx, commandAddress);
+    }
+
+    [SysAbiExport(
+        Nid = "3AyTaWcF-H8",
+        ExportName = "sceAgcDriverRegisterWorkloadStream",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgcDriver")]
+    public static int DriverRegisterWorkloadStream(CpuContext ctx)
+    {
+        var streamId = (uint)ctx[CpuRegister.Rdi];
+        var streamAddress = ctx[CpuRegister.Rsi];
+        if (streamId is < WorkloadStreamMinId or > WorkloadStreamMaxId)
+        {
+            return Graphics5DriverErrorInvalidValue;
+        }
+
+        if (streamAddress == 0)
+        {
+            return Graphics5DriverErrorInvalidArgument;
+        }
+
+        var stream = new byte[WorkloadStreamRecordSize];
+        if (!ctx.Memory.TryRead(streamAddress, stream))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        lock (_workloadStreamsGate)
+        {
+            if (!_workloadStreams.TryAdd(streamId, stream))
+            {
+                return Graphics5DriverErrorInvalidValue;
+            }
+        }
+
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
+        Nid = "LFSPFmGc9Hg",
+        ExportName = "sceAgcDcbSetWorkloadsActive",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbSetWorkloadsActive(CpuContext ctx)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var streamId = (uint)ctx[CpuRegister.Rsi];
+        var workloadIdsAddress = ctx[CpuRegister.Rdx];
+        var workloadCount = (uint)ctx[CpuRegister.Rcx];
+        if (commandBufferAddress == 0 || workloadIdsAddress == 0 ||
+            workloadCount == 0 || workloadCount > WorkloadIdMax ||
+            streamId is < WorkloadStreamMinId or > WorkloadStreamMaxId ||
+            !IsWorkloadStreamRegistered(streamId))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        ulong workloadMask = 0;
+        for (uint index = 0; index < workloadCount; index++)
+        {
+            if (!TryReadUInt32(ctx, workloadIdsAddress + ((ulong)index * sizeof(uint)), out var workloadId) ||
+                workloadId > WorkloadIdMax)
+            {
+                return ReturnPointer(ctx, 0);
+            }
+
+            var bit = 1UL << (int)workloadId;
+            if ((workloadMask & bit) != 0)
+            {
+                return ReturnPointer(ctx, 0);
+            }
+
+            workloadMask |= bit;
+        }
+
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, WorkloadActivePacketDwords, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(WorkloadActivePacketDwords, ItNop, RZero)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, streamId) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, (uint)workloadMask) ||
+            !TryWriteUInt32(ctx, commandAddress + 12, (uint)(workloadMask >> 32)))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    [SysAbiExport(
+        Nid = "hEK26Wdny6s",
+        ExportName = "sceAgcDcbSetWorkloadComplete",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int DcbSetWorkloadComplete(CpuContext ctx)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var streamId = (uint)ctx[CpuRegister.Rsi];
+        var workloadId = (uint)ctx[CpuRegister.Rdx];
+        if (commandBufferAddress == 0 || workloadId > WorkloadIdMax ||
+            streamId is < WorkloadStreamMinId or > WorkloadStreamMaxId ||
+            !IsWorkloadStreamRegistered(streamId))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        var clearMask = ~(1UL << (int)workloadId);
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, WorkloadCompletePacketDwords, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(WorkloadCompletePacketDwords, ItNop, RZero)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, streamId) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, workloadId) ||
+            !TryWriteUInt32(ctx, commandAddress + 12, (uint)clearMask) ||
+            !TryWriteUInt32(ctx, commandAddress + 16, (uint)(clearMask >> 32)))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    private static bool IsWorkloadStreamRegistered(uint streamId)
+    {
+        lock (_workloadStreamsGate)
+        {
+            return _workloadStreams.ContainsKey(streamId);
+        }
     }
 
     [SysAbiExport(
@@ -2698,6 +3322,29 @@ public static partial class AgcExports
             filter == KernelEventQueueCompatExports.KernelEventFilterGraphics
                 ? data
                 : ident));
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "5CdQTZIQPxM",
+        ExportName = "sceAgcDriverGetEqEventType",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgcDriver")]
+    public static int DriverGetEqEventType(CpuContext ctx)
+    {
+        var eventAddress = ctx[CpuRegister.Rdi];
+        if (eventAddress == 0 ||
+            !ctx.TryReadUInt64(eventAddress, out var ident) ||
+            !TryReadInt16(ctx, eventAddress + 8, out var filter) ||
+            !ctx.TryReadUInt64(eventAddress + 16, out var data))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        ctx[CpuRegister.Rax] = unchecked((uint)(
+            filter == KernelEventQueueCompatExports.KernelEventFilterGraphics
+                ? ident
+                : data));
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -2874,11 +3521,22 @@ public static partial class AgcExports
         var gpuState = _submittedGpuStates.GetValue(ctx.Memory, static _ => new SubmittedGpuState());
         lock (gpuState.Gate)
         {
-            gpuState.Graphics.QueueName = "dcb.graphics";
+            // Match Kyty's graphics ring: a blocked WAIT_REG_MEM yields its
+            // batch, so a later graphics submission can produce its label.
+            // The wait keeps its original parser state through GpuWaitRegistry;
+            // new work continues from an isolated state snapshot.
+            var graphicsState = gpuState.CurrentGraphics;
+            if (graphicsState.IsSuspended)
+            {
+                graphicsState = CreateDeferredGraphicsState(graphicsState);
+                gpuState.CurrentGraphics = graphicsState;
+            }
+
+            graphicsState.QueueName = "dcb.graphics";
             EnqueueSubmittedDcb(
                 ctx,
                 gpuState,
-                gpuState.Graphics,
+                graphicsState,
                 commandAddress,
                 dwordCount,
                 ++gpuState.SubmissionSequence,
@@ -3040,7 +3698,12 @@ public static partial class AgcExports
         LibraryName = "libSceAgc")]
     public static int SuspendPoint(CpuContext ctx)
     {
-        TraceAgc("agc.suspend_point");
+        // Kyty drains dedicated GPU rings here. SharpEmu's host presenter can
+        // have unresolved cross-queue work during startup; blocking this HLE
+        // import then wedges all guest threads. Keep it non-blocking until the
+        // backend exposes an all-queues idle primitive with deadlock-free
+        // startup semantics.
+        TraceAgc("agc.suspend_point deferred");
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -3118,12 +3781,64 @@ public static partial class AgcExports
         }
     }
 
+    private static SubmittedDcbState CreateDeferredGraphicsState(SubmittedDcbState source)
+    {
+        var snapshot = new SubmittedDcbState
+        {
+            QueueName = source.QueueName,
+            IsGraphicsQueue = true,
+            PresenterTexture = source.PresenterTexture,
+            GuestDrawKind = source.GuestDrawKind,
+            TranslatedDraw = source.TranslatedDraw,
+            PendingTargetlessDraw = source.PendingTargetlessDraw,
+            IndirectArgsAddress = source.IndirectArgsAddress,
+            SawIndexedDraw = source.SawIndexedDraw,
+            IndexBufferAddress = source.IndexBufferAddress,
+            IndexBufferCount = source.IndexBufferCount,
+            IndexSize = source.IndexSize,
+            InstanceCount = source.InstanceCount,
+            DrawIndexOffset = source.DrawIndexOffset,
+            FlipCount = source.FlipCount,
+        };
+
+        // Packet parsing mutates register and target maps in-place. Copy their
+        // membership so the yielded state remains an immutable continuation
+        // point while the later batch receives the exact CP state that led to
+        // the wait.
+        foreach (var (offset, value) in source.CxRegisters)
+        {
+            snapshot.CxRegisters.Add(offset, value);
+        }
+
+        foreach (var (offset, value) in source.ShRegisters)
+        {
+            snapshot.ShRegisters.Add(offset, value);
+        }
+
+        foreach (var (offset, value) in source.UcRegisters)
+        {
+            snapshot.UcRegisters.Add(offset, value);
+        }
+
+        foreach (var (address, target) in source.KnownRenderTargets)
+        {
+            snapshot.KnownRenderTargets.Add(address, target);
+        }
+
+        foreach (var (address, writer) in source.RenderTargetWriters)
+        {
+            snapshot.RenderTargetWriters.Add(address, writer);
+        }
+
+        return snapshot;
+    }
+
     private static void NotifySubmittedDcbCompleted(
         SubmittedGpuState gpuState,
         SubmittedDcbState state,
         ulong submissionId)
     {
-        if (!ReferenceEquals(state, gpuState.Graphics) ||
+        if (!state.IsGraphicsQueue ||
             state.CompletionEventNotifiedSubmissionId == submissionId)
         {
             return;
@@ -3205,7 +3920,8 @@ public static partial class AgcExports
         SubmittedDcbState state,
         ulong commandAddress,
         uint dwordCount,
-        bool tracePackets)
+        bool tracePackets,
+        BranchContinuation? branchContinuation = null)
     {
         var offset = 0u;
         while (offset < dwordCount)
@@ -3275,6 +3991,14 @@ public static partial class AgcExports
                 CountSubmittedOpcode(op, register);
             }
 
+            if (op == ItIndirectBuffer && length == 14 &&
+                ApplySubmittedBranch(
+                    ctx, gpuState, state, commandAddress, dwordCount, offset,
+                    currentAddress, tracePackets))
+            {
+                return true;
+            }
+
             if (op == ItNop &&
                 register is RDrawReset or RAcbReset &&
                 length >= 2)
@@ -3285,6 +4009,13 @@ public static partial class AgcExports
                     $"submission={state.ActiveSubmissionId} " +
                     $"kind={(register == RDrawReset ? "draw" : "acb")} " +
                     $"packet=0x{currentAddress:X16}");
+            }
+
+            if (op == ItClearState && length >= 2)
+            {
+                ResetSubmittedParserState(state);
+                TraceAgc($"agc.queue_reset queue={state.QueueName} " +
+                         $"submission={state.ActiveSubmissionId} kind=draw packet=0x{currentAddress:X16}");
             }
 
             if (op == ItNop && register == RAcquireMem && length >= 8)
@@ -3405,6 +4136,28 @@ public static partial class AgcExports
                     indexBaseLo | ((ulong)indexBaseHi << 32);
             }
 
+            if (op == ItDrawIndex2 &&
+                length >= 6 &&
+                TryReadUInt32(ctx, currentAddress + 8, out var drawIndexBaseLo) &&
+                TryReadUInt32(ctx, currentAddress + 12, out var drawIndexBaseHi) &&
+                TryReadUInt32(ctx, currentAddress + 16, out var drawIndexCount))
+            {
+                state.IndexBufferAddress = drawIndexBaseLo | ((ulong)drawIndexBaseHi << 32);
+                state.IndexBufferCount = drawIndexCount;
+            }
+
+            if (op == ItDispatchDrawPreamble &&
+                length >= 9 &&
+                TryReadUInt32(ctx, currentAddress + 4, out var multiIndexCount) &&
+                TryReadUInt32(ctx, currentAddress + 8, out var multiIndexBaseLo) &&
+                TryReadUInt32(ctx, currentAddress + 12, out var multiIndexBaseHi) &&
+                TryReadUInt32(ctx, currentAddress + 28, out var multiInstanceCount))
+            {
+                state.IndexBufferAddress = multiIndexBaseLo | ((ulong)multiIndexBaseHi << 32);
+                state.IndexBufferCount = multiIndexCount;
+                state.InstanceCount = Math.Max(1, multiInstanceCount);
+            }
+
             if (op == ItIndexBufferSize &&
                 length >= 2 &&
                 TryReadUInt32(ctx, currentAddress + 4, out var indexBufferCount))
@@ -3427,6 +4180,15 @@ public static partial class AgcExports
                 state.IndexSize = indexSize & 0x3;
             }
 
+            if (op == ItSetUconfigRegIndex &&
+                length >= 3 &&
+                TryReadUInt32(ctx, currentAddress + 4, out var indexedRegister) &&
+                TryReadUInt32(ctx, currentAddress + 8, out var indexedValue) &&
+                (indexedRegister & 0xFFFFu) == VgtIndexType)
+            {
+                state.IndexSize = indexedValue & 0x3;
+            }
+
             if (op == ItNumInstances &&
                 length >= 2 &&
                 TryReadUInt32(ctx, currentAddress + 4, out var instanceCount))
@@ -3441,7 +4203,7 @@ public static partial class AgcExports
                 if (HandleSubmittedWaitRegMem(
                         ctx, state, commandAddress, currentAddress, offset, length,
                         dwordCount, is64Bit: register == RWaitMem64, isStandard: false,
-                        tracePackets))
+                        tracePackets, branchContinuation))
                 {
                     return true; // DCB suspended until the awaited label is written
                 }
@@ -3451,7 +4213,8 @@ public static partial class AgcExports
             {
                 if (HandleSubmittedWaitRegMem(
                         ctx, state, commandAddress, currentAddress, offset, length,
-                        dwordCount, is64Bit: false, isStandard: true, tracePackets))
+                        dwordCount, is64Bit: false, isStandard: true,
+                        tracePackets, branchContinuation))
                 {
                     return true; // DCB suspended until the awaited label is written
                 }
@@ -3482,7 +4245,9 @@ public static partial class AgcExports
                 var indexed = op is
                     ItDrawIndex2 or
                     ItDrawIndexOffset2 or
-                    ItDrawIndexIndirect;
+                    ItDrawIndexIndirect or
+                    ItDrawIndexIndirectMulti or
+                    ItDispatchDrawPreamble;
                 state.SawIndexedDraw |= indexed;
                 TryTranslateGuestDraw(ctx, gpuState, state, indexCount, indexed);
             }
@@ -5064,7 +5829,8 @@ public static partial class AgcExports
         uint dwordCount,
         bool is64Bit,
         bool isStandard,
-        bool tracePacket)
+        bool tracePacket,
+        BranchContinuation? branchContinuation = null)
     {
         if (!TryParseSubmittedWait(
                 ctx, packetAddress, is64Bit, isStandard,
@@ -5142,6 +5908,7 @@ public static partial class AgcExports
             SubmissionId = state.ActiveSubmissionId,
             RegisteredTicks = System.Diagnostics.Stopwatch.GetTimestamp(),
             State = state,
+            Continuation = branchContinuation,
         };
 
         if (hasCurrent && GpuWaitRegistry.Compare(waiter, currentValue))
@@ -5433,6 +6200,20 @@ public static partial class AgcExports
         if (remainingDwords == 0)
         {
             state.IsSuspended = false;
+            if (waiter.Continuation is BranchContinuation parentContinuation &&
+                parentContinuation.RemainingDwords != 0 &&
+                ParseSubmittedDcb(
+                    ctx,
+                    gpuState,
+                    state,
+                    parentContinuation.ResumeAddress,
+                    parentContinuation.RemainingDwords,
+                    tracePackets))
+            {
+                state.IsSuspended = true;
+                return;
+            }
+
             state.HasActiveSubmission = false;
             NotifySubmittedDcbCompleted(gpuState, state, waiter.SubmissionId);
             PumpSubmittedQueue(ctx, gpuState, state);
@@ -5457,6 +6238,20 @@ public static partial class AgcExports
                 state,
                 waiter.ResumeAddress,
                 remainingDwords,
+                tracePackets))
+        {
+            state.IsSuspended = true;
+            return;
+        }
+
+        if (waiter.Continuation is BranchContinuation continuation &&
+            continuation.RemainingDwords != 0 &&
+            ParseSubmittedDcb(
+                ctx,
+                gpuState,
+                state,
+                continuation.ResumeAddress,
+                continuation.RemainingDwords,
                 tracePackets))
         {
             state.IsSuspended = true;
@@ -5653,6 +6448,92 @@ public static partial class AgcExports
             writeLength);
     }
 
+    // Kyty encodes CbBranch as the 14-DWORD form of INDIRECT_BUFFER.  A
+    // selected branch is parsed against the current CP state, exactly as an
+    // indirect buffer submitted by the guest would be.
+    private static bool ApplySubmittedBranch(
+        CpuContext ctx,
+        SubmittedGpuState gpuState,
+        SubmittedDcbState state,
+        ulong parentCommandAddress,
+        uint parentDwordCount,
+        uint parentOffset,
+        ulong packetAddress,
+        bool tracePacket)
+    {
+        if (!TryReadUInt32(ctx, packetAddress + 4, out var control) ||
+            !TryReadUInt32(ctx, packetAddress + 8, out var compareLo) ||
+            !TryReadUInt32(ctx, packetAddress + 12, out var compareHi) ||
+            !TryReadUInt32(ctx, packetAddress + 16, out var maskLo) ||
+            !TryReadUInt32(ctx, packetAddress + 20, out var maskHi) ||
+            !TryReadUInt32(ctx, packetAddress + 24, out var referenceLo) ||
+            !TryReadUInt32(ctx, packetAddress + 28, out var referenceHi) ||
+            !TryReadUInt32(ctx, packetAddress + 32, out var thenLo) ||
+            !TryReadUInt32(ctx, packetAddress + 36, out var thenHi) ||
+            !TryReadUInt32(ctx, packetAddress + 40, out var thenControl) ||
+            !TryReadUInt32(ctx, packetAddress + 44, out var elseLo) ||
+            !TryReadUInt32(ctx, packetAddress + 48, out var elseHi) ||
+            !TryReadUInt32(ctx, packetAddress + 52, out var elseControl))
+        {
+            return false;
+        }
+
+        var mode = control & 3u;
+        var compareFunction = (control >> 8) & 7u;
+        var compareAddress = (compareLo & 0xFFFF_FFF8u) | ((ulong)compareHi << 32);
+        var mask = maskLo | ((ulong)maskHi << 32);
+        var reference = referenceLo | ((ulong)referenceHi << 32);
+        var thenAddress = (thenLo & 0xFFFF_FFFCu) | ((ulong)thenHi << 32);
+        var thenDwordCount = thenControl & 0xFFFFFu;
+        var elseAddress = (elseLo & 0xFFFF_FFFCu) | ((ulong)elseHi << 32);
+        var elseDwordCount = elseControl & 0xFFFFFu;
+        if (compareAddress == 0 || mode is not (1u or 2u) || compareFunction > 6 ||
+            thenAddress == 0 || thenDwordCount == 0 || thenDwordCount > 1_000_000 ||
+            (mode == 2 && elseDwordCount != 0 && elseAddress == 0))
+        {
+            return false;
+        }
+
+        if (!TryReadUInt64(ctx, compareAddress, out var current))
+        {
+            return false;
+        }
+
+        var masked = current & mask;
+        var maskedReference = reference & mask;
+        var takeThen = compareFunction switch
+        {
+            0 => true,
+            1 => masked < maskedReference,
+            2 => masked <= maskedReference,
+            3 => masked == maskedReference,
+            4 => masked != maskedReference,
+            5 => masked >= maskedReference,
+            _ => masked > maskedReference,
+        };
+        var selectedAddress = takeThen ? thenAddress : elseAddress;
+        var selectedDwordCount = takeThen ? thenDwordCount : elseDwordCount;
+        if (tracePacket)
+        {
+            TraceAgc($"agc.dcb.branch take={(takeThen ? "then" : "else")} " +
+                     $"then=0x{thenAddress:X16}/{thenDwordCount} else=0x{elseAddress:X16}/{elseDwordCount}");
+        }
+
+        if (selectedDwordCount == 0)
+        {
+            return false;
+        }
+
+        var parentResumeOffset = parentOffset + 14;
+        var continuation = parentResumeOffset < parentDwordCount
+            ? new BranchContinuation(
+                parentCommandAddress + ((ulong)parentResumeOffset * sizeof(uint)),
+                parentDwordCount - parentResumeOffset)
+            : null;
+        return ParseSubmittedDcbCore(
+            ctx, gpuState, state, selectedAddress, selectedDwordCount, tracePacket, continuation);
+    }
+
     private static void ApplySubmittedRegisters(
         CpuContext ctx,
         SubmittedDcbState state,
@@ -5686,6 +6567,43 @@ public static partial class AgcExports
                 }
 
                 directDestination[startRegister + index] = value;
+            }
+
+            return;
+        }
+
+        if (op is ItSetContextRegIndirect or ItSetShRegIndirect or ItSetUconfigRegIndirect)
+        {
+            if (packetLength < 5 ||
+                !TryReadUInt32(ctx, packetAddress + 4, out var addressLow) ||
+                !TryReadUInt32(ctx, packetAddress + 8, out var addressHigh) ||
+                !TryReadUInt32(ctx, packetAddress + 16, out var nativeRegisterCount))
+            {
+                return;
+            }
+
+            var nativeRegistersAddress = ((ulong)addressHigh << 32) | (addressLow & 0xFFFF_FFFCu);
+            var nativeDestination = op switch
+            {
+                ItSetContextRegIndirect => state.CxRegisters,
+                ItSetShRegIndirect => state.ShRegisters,
+                _ => state.UcRegisters,
+            };
+            for (uint index = 0; index < (nativeRegisterCount & 0x3FFFu); index++)
+            {
+                var entryAddress = nativeRegistersAddress + ((ulong)index * 8);
+                if (!TryReadUInt32(ctx, entryAddress, out var registerOffset) ||
+                    !TryReadUInt32(ctx, entryAddress + sizeof(uint), out var value))
+                {
+                    return;
+                }
+
+                if (op == ItSetContextRegIndirect)
+                {
+                    registerOffset = NormalizeIndirectCxRegisterOffset(registerOffset);
+                }
+
+                nativeDestination[registerOffset] = value;
             }
 
             return;
@@ -5760,6 +6678,8 @@ public static partial class AgcExports
 
                 state.DrawIndexOffset = indexOffset;
                 return TryReadUInt32(ctx, packetAddress + 12, out drawCount);
+            case ItDispatchDrawPreamble when packetLength >= 9:
+                return TryReadUInt32(ctx, packetAddress + 4, out drawCount);
             case ItDrawIndexMultiAuto when packetLength >= 4:
                 if (!TryReadUInt32(ctx, packetAddress + 12, out var control))
                 {
@@ -5768,7 +6688,7 @@ public static partial class AgcExports
 
                 drawCount = (control >> 21) & 0x7FFu;
                 return true;
-            case ItDrawIndirect or ItDrawIndexIndirect
+            case ItDrawIndirect or ItDrawIndexIndirect or ItDrawIndexIndirectMulti
                 when packetLength >= 5 && state.IndirectArgsAddress != 0:
                 if (!TryReadUInt32(ctx, packetAddress + 4, out var dataOffset))
                 {
@@ -10973,17 +11893,21 @@ public static partial class AgcExports
     private static bool IsEsGeometryShaderType(byte shaderType) =>
         shaderType is 2 or 6;
 
-    private static int SetIndirectPatchAddress(CpuContext ctx, string registerSpace)
+    private static int SetIndirectPatchAddress(CpuContext ctx, uint packetType, string registerSpace)
     {
         var commandAddress = ctx[CpuRegister.Rdi];
         var registersAddress = ctx[CpuRegister.Rsi];
-        if (commandAddress == 0 || registersAddress == 0)
+        if (commandAddress == 0 || registersAddress == 0 ||
+            !TryReadUInt32(ctx, commandAddress, out var header) ||
+            ((header >> 8) & 0xFFu) != packetType)
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        if (!TryWriteUInt32(ctx, commandAddress + 8, (uint)(registersAddress & 0xFFFF_FFFFUL)) ||
-            !TryWriteUInt32(ctx, commandAddress + 12, (uint)(registersAddress >> 32)))
+        if (!TryReadUInt32(ctx, commandAddress + 4, out var addressLow) ||
+            !TryWriteUInt32(ctx, commandAddress + 4,
+                (addressLow & 0x3u) | (uint)registersAddress & 0xFFFF_FFFCu) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, (uint)(registersAddress >> 32)))
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
@@ -11011,6 +11935,34 @@ public static partial class AgcExports
         return TryWriteUInt32(ctx, commandAddress + 4, patchedControl)
             ? SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK)
             : SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+    }
+
+    private static int PatchJumpTarget(CpuContext ctx)
+    {
+        var commandAddress = ctx[CpuRegister.Rdi];
+        var targetAddress = ctx[CpuRegister.Rsi];
+        var dwordCount = (uint)ctx[CpuRegister.Rdx];
+        if (!TryReadUInt32(ctx, commandAddress, out var header) ||
+            ((header >> 8) & 0xFFu) != ItIndirectBuffer)
+        {
+            ctx[CpuRegister.Rax] = Graphics5ErrorInvalidPacket;
+            return unchecked((int)Graphics5ErrorInvalidPacket);
+        }
+
+        // Preserve the packet's cache/control bits while applying Kyty's
+        // target address and length masks to the indirect-buffer packet.
+        if (!TryReadUInt32(ctx, commandAddress + 8, out var addressHigh) ||
+            !TryReadUInt32(ctx, commandAddress + 12, out var sizeAndControl) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, (uint)targetAddress) ||
+            !TryWriteUInt32(ctx, commandAddress + 8,
+                (addressHigh & 0xFFFF_0000u) | (uint)(targetAddress >> 32) & 0xFFFFu) ||
+            !TryWriteUInt32(ctx, commandAddress + 12,
+                (sizeAndControl & 0xFFF0_0000u) | (dwordCount & 0x000F_FFFFu)))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
     private static bool TryResolveWriteDataPatchArguments(
@@ -11049,27 +12001,56 @@ public static partial class AgcExports
         return op == ItWriteData || (op == ItNop && register == RWriteData);
     }
 
-    private static int AddIndirectPatchRegisters(CpuContext ctx, string registerSpace)
+    private static int SetIndirectPatchRegisterCount(CpuContext ctx, uint packetType)
     {
         var commandAddress = ctx[CpuRegister.Rdi];
         var registerCount = (uint)ctx[CpuRegister.Rsi];
-        if (commandAddress == 0)
+        if (commandAddress == 0 ||
+            !TryReadUInt32(ctx, commandAddress, out var header) ||
+            ((header >> 8) & 0xFFu) != packetType)
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
         }
 
-        if (!TryReadUInt32(ctx, commandAddress + 4, out var currentCount) ||
-            !TryWriteUInt32(ctx, commandAddress + 4, currentCount + registerCount))
+        if (!TryReadUInt32(ctx, commandAddress + 16, out var currentCount) ||
+            !TryWriteUInt32(ctx, commandAddress + 16,
+                (currentCount & ~0x3FFFu) | (registerCount & 0x3FFFu)))
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
         }
 
-        TraceAgc($"agc.patch_{registerSpace}_add cmd=0x{commandAddress:X16} add={registerCount} total={currentCount + registerCount}");
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
-    private static int DcbSetRegistersIndirect(CpuContext ctx, uint packetRegister, string registerSpace)
+    private static int AddIndirectPatchRegisters(CpuContext ctx, uint packetType, string registerSpace)
+    {
+        var commandAddress = ctx[CpuRegister.Rdi];
+        var registerCount = (uint)ctx[CpuRegister.Rsi];
+        if (commandAddress == 0 ||
+            !TryReadUInt32(ctx, commandAddress, out var header) ||
+            ((header >> 8) & 0xFFu) != packetType)
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        if (!TryReadUInt32(ctx, commandAddress + 16, out var currentCount))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        var total = ((currentCount & 0x3FFFu) + registerCount) & 0x3FFFu;
+        if (!TryWriteUInt32(ctx, commandAddress + 16, (currentCount & ~0x3FFFu) | total))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceAgc($"agc.patch_{registerSpace}_add cmd=0x{commandAddress:X16} add={registerCount} total={total}");
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static int DcbSetRegistersIndirect(CpuContext ctx, uint packetType, string registerSpace)
     {
         var commandBufferAddress = ctx[CpuRegister.Rdi];
         var registersAddress = ctx[CpuRegister.Rsi];
@@ -11079,11 +12060,12 @@ public static partial class AgcExports
             return ReturnPointer(ctx, 0);
         }
 
-        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 4, out var commandAddress) ||
-            !TryWriteUInt32(ctx, commandAddress, Pm4(4, ItNop, packetRegister)) ||
-            !TryWriteUInt32(ctx, commandAddress + 4, registerCount) ||
-            !TryWriteUInt32(ctx, commandAddress + 8, (uint)(registersAddress & 0xFFFF_FFFFUL)) ||
-            !TryWriteUInt32(ctx, commandAddress + 12, (uint)(registersAddress >> 32)))
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 5, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(5, packetType, 0)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, (uint)registersAddress & 0xFFFF_FFFCu) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, (uint)(registersAddress >> 32)) ||
+            !TryWriteUInt32(ctx, commandAddress + 12, 0x8000_0000u) ||
+            !TryWriteUInt32(ctx, commandAddress + 16, registerCount & 0x3FFFu))
         {
             return ReturnPointer(ctx, 0);
         }
@@ -11351,6 +12333,260 @@ public static partial class AgcExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // ShaderRegister is an eight-byte SysV aggregate: offset in the low DWORD
+    // and value in the high DWORD of the second argument register.
+    private static int DcbSetRegisterDirect(CpuContext ctx, uint packetType, string registerSpace)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var register = ctx[CpuRegister.Rsi];
+        var offset = (uint)register;
+        var value = (uint)(register >> 32);
+        if (commandBufferAddress == 0 ||
+            !TryAllocateCommandDwords(ctx, commandBufferAddress, 3, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(3, packetType, 0)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, offset & 0xFFFFu) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, value))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        TraceAgc($"agc.dcb_set_{registerSpace}_reg_direct buf=0x{commandBufferAddress:X16} " +
+                 $"cmd=0x{commandAddress:X16} offset=0x{offset:X4} value=0x{value:X8}");
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    private static int DcbDrawIndirectCore(CpuContext ctx, uint packetType, bool indexed)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var dataOffset = (uint)ctx[CpuRegister.Rsi];
+        var modifier = ctx[CpuRegister.Rdx];
+        var patchOffsets = DecodeIndirectModifierPatchOffsets(modifier, indexed);
+        if (commandBufferAddress == 0 ||
+            !TryAllocateCommandDwords(ctx, commandBufferAddress, 5, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(5, packetType, 0)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, dataOffset) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, (uint)patchOffsets) ||
+            !TryWriteUInt32(ctx, commandAddress + 12, (uint)(patchOffsets >> 32)) ||
+            !TryWriteUInt32(ctx, commandAddress + 16, DecodeIndirectDrawInitiator(modifier)))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        TraceAgc($"agc.dcb_draw_{(indexed ? "index_" : string.Empty)}indirect " +
+                 $"buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} offset=0x{dataOffset:X8}");
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    private static int DcbCondExecCore(CpuContext ctx)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var conditionAddress = ctx[CpuRegister.Rsi];
+        var dwordCount = (uint)ctx[CpuRegister.Rdx];
+        if (commandBufferAddress == 0 || conditionAddress == 0 ||
+            (conditionAddress & 3) != 0 || dwordCount > 0x3FFF ||
+            !TryAllocateCommandDwords(ctx, commandBufferAddress, 5, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(5, ItCondExec, 0)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, (uint)conditionAddress & 0xFFFF_FFFCu) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, (uint)(conditionAddress >> 32)) ||
+            !TryWriteUInt32(ctx, commandAddress + 12, 0) ||
+            !TryWriteUInt32(ctx, commandAddress + 16, dwordCount))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    private static int DcbCopyDataCore(CpuContext ctx, bool acbSourceEncoding)
+    {
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var destination = (uint)(ctx[CpuRegister.Rsi] & 0xFF);
+        var destinationCachePolicy = (uint)(ctx[CpuRegister.Rdx] & 0xFF);
+        var destinationAddress = ctx[CpuRegister.Rcx];
+        var source = (uint)(ctx[CpuRegister.R8] & 0xFF);
+        var sourceCachePolicy = (uint)(ctx[CpuRegister.R9] & 0xFF);
+        var stackAddress = ctx[CpuRegister.Rsp];
+        if (!TryReadUInt64(ctx, stackAddress + 8, out var sourceAddress) ||
+            !TryReadUInt64(ctx, stackAddress + 16, out var itemSizeRaw) ||
+            !TryReadUInt64(ctx, stackAddress + 24, out var writeConfirmRaw))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        // Kyty converts ACB's selector 5 into DCB's selector 10 before
+        // emitting the common COPY_DATA packet.
+        if (acbSourceEncoding && source == 5)
+        {
+            source <<= 1;
+        }
+
+        var control = ((source >> 1) & 0xFu) |
+                      (((destination >> 1) & 0xFu) << 8) |
+                      ((sourceCachePolicy & 3u) << 13) |
+                      (((uint)itemSizeRaw & 1u) << 16) |
+                      (((uint)writeConfirmRaw & 1u) << 20) |
+                      ((destinationCachePolicy & 3u) << 25) |
+                      ((source & 1u) << 30);
+        if (commandBufferAddress == 0 ||
+            !TryAllocateCommandDwords(ctx, commandBufferAddress, 6, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(6, ItCopyData, 0)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4, control) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, (uint)sourceAddress) ||
+            !TryWriteUInt32(ctx, commandAddress + 12, (uint)(sourceAddress >> 32)) ||
+            !TryWriteUInt32(ctx, commandAddress + 16, (uint)destinationAddress) ||
+            !TryWriteUInt32(ctx, commandAddress + 20, (uint)(destinationAddress >> 32)))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        return ReturnPointer(ctx, commandAddress);
+    }
+
+    private static ulong DecodeIndirectModifierPatchOffsets(ulong modifier, bool indexed)
+    {
+        var low = (uint)modifier;
+        var shaderStage = low >> 29;
+        var sgprBase = (shaderStage is 3 or 5 ? 0x80u : 0u) + 0x8Cu;
+        ulong baseVertexLocation = (low & 1) != 0 ? sgprBase + ((low >> 9) & 0x1Fu) : 0x280u;
+        var startInstanceLocation = (low & 4) != 0 ? sgprBase + ((low >> 19) & 0x1Fu) : 0x280u;
+        if (indexed && (low & 2) != 0)
+        {
+            baseVertexLocation |= ((ulong)(sgprBase + ((low >> 14) & 0x1Fu)) << 16) | (1UL << 59);
+        }
+
+        return baseVertexLocation | ((ulong)startInstanceLocation << 32);
+    }
+
+    private static uint DecodeIndirectDrawInitiator(ulong modifier) =>
+        (modifier & (1UL << 32)) != 0 ? 2u : (((uint)modifier >> 3) & 0x20u) | 2u;
+
+    private static uint DecodeDrawIndexInitiator(ulong modifier) =>
+        (modifier & (1UL << 32)) != 0 ? 0u : ((uint)modifier >> 3) & 0x20u;
+
+    // Prospero::GsOutputPrimitiveType values from Kyty's gpu_defs.h.
+    private static uint PrimitiveTypeToGsOutput(uint primitiveType) => primitiveType switch
+    {
+        1 => 0, // PointList -> Points
+        2 or 3 or 10 or 11 or 18 => 1, // line topologies -> Lines
+        7 => 3, // RectList -> 2dRectangle
+        17 => 4, // legacy RectList -> RectList
+        _ => 2, // all remaining supported topologies -> Triangles
+    };
+
+    private static bool TryGetShaderHalfTypes(
+        CpuContext ctx,
+        ulong frontAddress,
+        ulong backAddress,
+        out byte frontType,
+        out byte backType)
+    {
+        if (frontAddress == 0 || backAddress == 0 ||
+            !TryReadByte(ctx, frontAddress + ShaderTypeOffset, out frontType) ||
+            !TryReadByte(ctx, backAddress + ShaderTypeOffset, out backType))
+        {
+            frontType = 0;
+            backType = 0;
+            return false;
+        }
+
+        return (frontType == 4 && backType == 6) || (frontType == 5 && backType == 7);
+    }
+
+    private static bool PatchFusedShaderRegisters(
+        CpuContext ctx,
+        ulong fusedRegisters,
+        uint fusedRegisterCount,
+        ulong frontRegisters,
+        uint frontRegisterCount,
+        ulong frontCode,
+        byte frontType)
+    {
+        if (fusedRegisters == 0 || frontRegisters == 0)
+        {
+            return false;
+        }
+
+        // GS fusion copies both checksum occurrences from the front half.
+        if (frontType == 4)
+        {
+            for (uint occurrence = 0; occurrence < 2; occurrence++)
+            {
+                var destination = 0UL;
+                var source = 0UL;
+                if (!TryFindShaderRegister(ctx, fusedRegisters, fusedRegisterCount, SpiShaderPgmChksumGs, occurrence, out destination) ||
+                    !TryFindShaderRegister(ctx, frontRegisters, frontRegisterCount, SpiShaderPgmChksumGs, occurrence, out source) ||
+                    !TryReadUInt32(ctx, source + 4, out var checksum) ||
+                    !TryWriteUInt32(ctx, destination + 4, checksum))
+                {
+                    // Kyty silently leaves a missing checksum register alone;
+                    // only an inaccessible register array is an error here.
+                    if (destination == 0 || source == 0)
+                    {
+                        continue;
+                    }
+                    return false;
+                }
+            }
+        }
+
+        var programLo = frontType == 4 ? SpiShaderPgmLoEs : SpiShaderPgmLoLs;
+        if (!TryFindShaderRegister(ctx, fusedRegisters, fusedRegisterCount, programLo, 0, out var loAddress))
+        {
+            return true; // Kyty also treats an absent program register as a no-op.
+        }
+
+        var hiAddress = loAddress + 8;
+        if (!TryReadUInt32(ctx, hiAddress, out var hiOffset) || hiOffset != programLo + 1 ||
+            !TryReadUInt32(ctx, hiAddress + 4, out var hiValue) ||
+            !TryWriteUInt32(ctx, loAddress + 4, (uint)(frontCode >> 8)) ||
+            !TryWriteUInt32(ctx, hiAddress + 4,
+                (hiValue & 0xFFFF_FF00u) | ((uint)(frontCode >> 40) & 0xFFu)))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool TryFindShaderRegister(
+        CpuContext ctx,
+        ulong registersAddress,
+        uint registerCount,
+        uint offset,
+        uint occurrence,
+        out ulong registerAddress)
+    {
+        for (uint index = 0; index < registerCount; index++)
+        {
+            var candidate = registersAddress + ((ulong)index * 8);
+            if (!TryReadUInt32(ctx, candidate, out var candidateOffset))
+            {
+                registerAddress = 0;
+                return false;
+            }
+
+            if (candidateOffset != offset)
+            {
+                continue;
+            }
+
+            if (occurrence-- == 0)
+            {
+                registerAddress = candidate;
+                return true;
+            }
+        }
+
+        registerAddress = 0;
+        return false;
+    }
+
+    private static int ReturnSize(CpuContext ctx, uint bytes)
+    {
+        ctx[CpuRegister.Rax] = bytes;
+        return unchecked((int)bytes);
+    }
+
     private static int SetReturn(CpuContext ctx, OrbisGen2Result result)
     {
         ctx[CpuRegister.Rax] = unchecked((ulong)(int)result);
@@ -11377,6 +12613,13 @@ public static partial class AgcExports
 
         value = buffer[0];
         return true;
+    }
+
+    private static bool TryWriteByte(CpuContext ctx, ulong address, byte value)
+    {
+        Span<byte> buffer = stackalloc byte[1];
+        buffer[0] = value;
+        return ctx.Memory.TryWrite(address, buffer);
     }
 
     // A submitted command buffer is bulk-copied once per submit and served
@@ -11842,22 +13085,29 @@ public static partial class AgcExports
         LibraryName = "libSceAgc")]
     public static int DcbSetPredication(CpuContext ctx)
     {
-        var dcb = ctx[CpuRegister.Rdi];
-        var address = ctx[CpuRegister.Rsi];
-        if (dcb == 0)
+        var commandBufferAddress = ctx[CpuRegister.Rdi];
+        var condition = (uint)(ctx[CpuRegister.Rsi] & 0xFF);
+        var operation = (uint)(ctx[CpuRegister.Rdx] & 0xFF);
+        var waitOperation = (uint)(ctx[CpuRegister.Rcx] & 0xFF);
+        var address = ctx[CpuRegister.R8];
+        if (commandBufferAddress == 0)
         {
             return ReturnPointer(ctx, 0);
         }
 
-        if (!TryAllocateCommandDwords(ctx, dcb, 3, out var cmd) ||
-            !ctx.TryWriteUInt32(cmd, Pm4(3, ItNop, RZero)) ||
-            !ctx.TryWriteUInt32(cmd + 4, (uint)(address & 0xFFFF_FFFFUL)) ||
-            !ctx.TryWriteUInt32(cmd + 8, (uint)(address >> 32)))
+        // count_in_dwords (r9) is deliberately unused by Kyty's hardware
+        // packet encoding, which always emits the four-DWORD predicate form.
+        if (!TryAllocateCommandDwords(ctx, commandBufferAddress, 4, out var commandAddress) ||
+            !TryWriteUInt32(ctx, commandAddress, Pm4(4, ItSetPredication, 0)) ||
+            !TryWriteUInt32(ctx, commandAddress + 4,
+                ((condition & 1u) << 8) | ((waitOperation & 1u) << 12) | ((operation & 7u) << 16)) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, (uint)address & 0xFFFF_FFF0u) ||
+            !TryWriteUInt32(ctx, commandAddress + 12, (uint)(address >> 32)))
         {
             return ReturnPointer(ctx, 0);
         }
 
-        return ReturnPointer(ctx, cmd);
+        return ReturnPointer(ctx, commandAddress);
     }
 
     [SysAbiExport(
@@ -11867,10 +13117,114 @@ public static partial class AgcExports
         LibraryName = "libSceAgc")]
     public static int SetPacketPredication(CpuContext ctx)
     {
-        // Global predication toggle on a packet; a no-op is safe for rendering.
-        ctx[CpuRegister.Rax] = 0;
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        var packetAddress = ctx[CpuRegister.Rdi];
+        var predication = (byte)ctx[CpuRegister.Rsi];
+        if (!TryReadUInt32(ctx, packetAddress, out var header) ||
+            !TryWriteUInt32(ctx, packetAddress, (header & ~1u) | (predication == 1 ? 1u : 0u)))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
+
+    [SysAbiExport(
+        Nid = "Lkf86B98qPc",
+        ExportName = "sceAgcGetPacketSize",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int GetPacketSize(CpuContext ctx)
+    {
+        if (!TryReadUInt32(ctx, ctx[CpuRegister.Rdi], out var header))
+        {
+            return ReturnSize(ctx, 0);
+        }
+
+        // Kyty treats a type-2 packet (0x3fff10xx) as its single DWORD header.
+        var dwords = (header & 0x3FFF_FF00u) == 0x3FFF_1000u
+            ? 1u
+            : ((header >> 16) & 0x3FFFu) + 2u;
+        return ReturnSize(ctx, dwords);
+    }
+
+    [SysAbiExport(
+        Nid = "n8vgpaQg6dA",
+        ExportName = "sceAgcSetRangePredication",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgc")]
+    public static int SetRangePredication(CpuContext ctx)
+    {
+        var packetAddress = ctx[CpuRegister.Rdi];
+        var endAddress = ctx[CpuRegister.Rsi];
+        var predicationBit = (byte)ctx[CpuRegister.Rdx] == 1 ? 1u : 0u;
+        while (packetAddress < endAddress)
+        {
+            if (!TryReadUInt32(ctx, packetAddress, out var header) ||
+                !TryWriteUInt32(ctx, packetAddress, (header & ~1u) | predicationBit))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+            }
+
+            var dwords = (header & 0x3FFF_FF00u) == 0x3FFF_1000u
+                ? 1u
+                : ((header >> 16) & 0x3FFFu) + 2u;
+            if (dwords == 0 || packetAddress > ulong.MaxValue - ((ulong)dwords * sizeof(uint)))
+            {
+                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+            }
+
+            packetAddress += (ulong)dwords * sizeof(uint);
+        }
+
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(Nid = "ORWsxIbk4TE", ExportName = "sceAgcCondExecPatchSetEnd", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int CondExecPatchSetEnd(CpuContext ctx)
+    {
+        var commandAddress = ctx[CpuRegister.Rdi];
+        var endAddress = ctx[CpuRegister.Rsi];
+        if (!TryGetPacketIdentity(ctx, commandAddress, out var op, out _) || op != ItCondExec ||
+            endAddress < commandAddress + 5 * sizeof(uint))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        var dwords = (endAddress - (commandAddress + 5 * sizeof(uint))) / sizeof(uint);
+        if (dwords > 0x3FFF || !TryReadUInt32(ctx, commandAddress + 16, out var count) ||
+            !TryWriteUInt32(ctx, commandAddress + 16, (count & ~0x3FFFu) | (uint)dwords))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    // Kyty exports this second NID against the same implementation.
+    #pragma warning disable SHEM004
+    [SysAbiExport(Nid = "k-JpyR2dYAM", ExportName = "sceAgcCondExecPatchSetEnd", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int CondExecPatchSetEnd2(CpuContext ctx) => CondExecPatchSetEnd(ctx);
+    #pragma warning restore SHEM004
+
+    [SysAbiExport(Nid = "YWTKOju587o", ExportName = "sceAgcCondExecPatchSetCommandAddress", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int CondExecPatchSetCommandAddress(CpuContext ctx)
+    {
+        var commandAddress = ctx[CpuRegister.Rdi];
+        var targetAddress = ctx[CpuRegister.Rsi];
+        if ((targetAddress & 3) != 0 || !TryGetPacketIdentity(ctx, commandAddress, out var op, out _) || op != ItCondExec ||
+            !TryWriteUInt32(ctx, commandAddress + 4, (uint)targetAddress & 0xFFFF_FFFCu) ||
+            !TryWriteUInt32(ctx, commandAddress + 8, (uint)(targetAddress >> 32)))
+        {
+            return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
+        }
+
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    #pragma warning disable SHEM004
+    [SysAbiExport(Nid = "3ZWa3AoyWZQ", ExportName = "sceAgcCondExecPatchSetCommandAddress", Target = Generation.Gen5, LibraryName = "libSceAgc")]
+    public static int CondExecPatchSetCommandAddress2(CpuContext ctx) => CondExecPatchSetCommandAddress(ctx);
+    #pragma warning restore SHEM004
 
     // ABI (reversed from Quake): rdi = array of DCB base addresses (u64 each),
     // rsi = array of DCB sizes in dwords (u32 each), rdx = buffer count.

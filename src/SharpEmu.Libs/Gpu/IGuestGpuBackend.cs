@@ -169,8 +169,8 @@ internal interface IGuestGpuBackend
         uint height,
         uint pitchInPixel);
 
-    /// <summary>Registers a display buffer with its guest texture format tag.</summary>
-    void RegisterKnownDisplayBuffer(ulong address, uint guestFormat);
+    /// <summary>Registers a display buffer and creates its host surface.</summary>
+    void RegisterKnownDisplayBuffer(ulong address, uint guestFormat, uint width, uint height);
 
     /// <summary>Format/numberType are raw guest texture descriptor codes.</summary>
     bool IsGpuGuestImageAvailable(ulong address, uint format, uint numberType);

@@ -63,7 +63,7 @@ internal static class PngSplashLoader
         }
     }
 
-    private static bool TryDecode(
+    internal static bool TryDecode(
         ReadOnlySpan<byte> png,
         out byte[] pixels,
         out uint width,

@@ -153,6 +153,25 @@ public sealed class RtcExportsTests
         Assert.Equal(1_000_000, RtcExports.RtcGetTickResolution(_ctx));
     }
 
+    [Fact]
+    public void LocalAndUtcTickConversion_IsHostIndependentKytyIdentity()
+    {
+        const ulong tick = Y2KTick + 12_345_678;
+        Assert.True(_ctx.TryWriteUInt64(TickAddress, tick));
+
+        _ctx[CpuRegister.Rdi] = TickAddress;
+        _ctx[CpuRegister.Rsi] = OutAddress;
+        Assert.Equal(0, RtcExports.RtcConvertLocalTimeToUtc(_ctx));
+        Assert.True(_ctx.TryReadUInt64(OutAddress, out var utc));
+        Assert.Equal(tick, utc);
+
+        _ctx[CpuRegister.Rdi] = OutAddress;
+        _ctx[CpuRegister.Rsi] = SecondTickAddress;
+        Assert.Equal(0, RtcExports.RtcConvertUtcToLocalTime(_ctx));
+        Assert.True(_ctx.TryReadUInt64(SecondTickAddress, out var local));
+        Assert.Equal(tick, local);
+    }
+
     [Theory]
     [InlineData(2000, 1)] // divisible by 400
     [InlineData(2004, 1)] // divisible by 4
